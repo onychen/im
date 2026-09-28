@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "GoIM 朋友圈动态扇出时序",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 880],
+    "column_fit": "spread",
+    "animation": "trace",
+    "views": [
+      {
+        "id": "publish",
+        "label": "发布与落库",
+        "focus": ["author", "api", "mysql", "kafka"],
+        "note": "作者经 REST 发布动态，同步落库后发布 moment_push 异步事件。"
+      },
+      {
+        "id": "biguser-pull",
+        "label": "大V降级",
+        "focus": ["consumer", "redis"],
+        "note": "好友数超阈值的作者标记为大V，跳过写扩散仅存寄件箱。"
+      },
+      {
+        "id": "write-fanout",
+        "label": "普通用户写扩散",
+        "focus": ["consumer", "redis", "friend"],
+        "note": "普通动态批量写扩散到好友时间线并按上限裁剪。"
+      },
+      {
+        "id": "feed-read",
+        "label": "动态流读取",
+        "focus": ["friend", "api", "redis"],
+        "note": "好友读取时合并收件箱与关注的大V寄件箱，游标分页返回。"
+      }
+    ]
+  },
+  "participants": [
+    { "id": "author", "type": "external", "label": "作者", "sublabel": "发布动态" },
+    { "id": "api", "type": "backend", "label": "REST API", "sublabel": "朋友圈接口" },
+    { "id": "mysql", "type": "database", "label": "MySQL", "sublabel": "动态表", "brand": "mysql" },
+    { "id": "kafka", "type": "messagebus", "label": "Kafka", "sublabel": "动态事件", "brand": "kafka" },
+    { "id": "consumer", "type": "backend", "label": "动态消费者", "sublabel": "扇出分发" },
+    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "时间线 ZSet", "brand": "redis" },
+    { "id": "friend", "type": "external", "label": "好友", "sublabel": "浏览动态流" }
+  ],
+  "segments": [
+    { "from": 150, "to": 332, "label": "发布与落库" },
+    { "from": 340, "to": 500, "label": "分流判定" },
+    { "from": 508, "to": 650, "label": "写扩散" },
+    { "from": 658, "to": 830, "label": "动态流读取" }
+  ],
+  "messages": [
+    { "id": "post-moment", "from": "author", "to": "api", "y": 160, "label": "POST /moment", "variant": "emphasis" },
+    { "id": "insert-moment", "from": "api", "to": "mysql", "y": 200, "label": "插入动态记录", "variant": "emphasis" },
+    { "id": "moment-id", "from": "mysql", "to": "api", "y": 252, "label": "moment_id", "variant": "return" },
+    { "id": "publish-moment", "from": "api", "to": "kafka", "y": 294, "label": "发布 moment_push 事件", "variant": "emphasis" },
+    { "id": "created", "from": "api", "to": "author", "y": 334, "label": "201 创建成功", "variant": "return" },
+    { "id": "consume-moment", "from": "kafka", "to": "consumer", "y": 372, "label": "消费动态事件", "variant": "default" },
+    { "id": "write-outbox", "from": "consumer", "to": "redis", "y": 412, "label": "写作者寄件箱", "variant": "emphasis" },
+    { "id": "count-friends", "from": "consumer", "to": "mysql", "y": 452, "label": "统计好友数", "variant": "default" },
+    { "id": "friend-count", "from": "mysql", "to": "consumer", "y": 492, "label": "好友数", "variant": "return" },
+    { "id": "mark-biguser", "from": "consumer", "to": "redis", "y": 540, "label": "超阈值：标记大V 跳过扩散", "variant": "dashed" },
+    { "id": "get-friends", "from": "consumer", "to": "mysql", "y": 580, "label": "读取好友列表", "variant": "default" },
+    { "id": "fanout", "from": "consumer", "to": "redis", "y": 620, "label": "批量写扩散 + 裁剪时间线", "variant": "emphasis" },
+    { "id": "get-feed", "from": "friend", "to": "api", "y": 668, "label": "GET /moment/feed", "variant": "emphasis" },
+    { "id": "read-timeline", "from": "api", "to": "redis", "y": 700, "label": "读取收件箱并合并大V寄件箱", "variant": "emphasis" },
+    { "id": "timeline-page", "from": "redis", "to": "api", "y": 740, "label": "时间线分页", "variant": "return" },
+    { "id": "feed-page", "from": "api", "to": "friend", "y": 790, "label": "200 动态流 + 游标", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "api", "from": 168, "to": 342, "type": "backend" },
+    { "participant": "mysql", "from": 196, "to": 258, "type": "database" },
+    { "participant": "kafka", "from": 290, "to": 380, "type": "messagebus" },
+    { "participant": "consumer", "from": 368, "to": 632, "type": "backend" },
+    { "participant": "redis", "from": 408, "to": 546, "type": "database" },
+    { "participant": "mysql", "from": 450, "to": 506, "type": "database" },
+    { "participant": "redis", "from": 616, "to": 628, "type": "database" },
+    { "participant": "api", "from": 678, "to": 814, "type": "backend" },
+    { "participant": "redis", "from": 708, "to": 768, "type": "database" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "推拉结合",
+      "items": [
+        "每条动态先写作者寄件箱，作为拉取源与作者自见来源",
+        "普通好友走写扩散到收件箱，大V好友读取时再拉取寄件箱合并"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "热点降级",
+      "items": [
+        "好友数超过阈值的作者被标记为大V，跳过写扩散",
+        "私密动态不扩散，仅保留在作者寄件箱"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "时间线治理",
+      "items": [
+        "扇出后按时间线长度上限裁剪，控制大V与长活跃好友的内存占用",
+        "动态流经游标分页返回，避免深翻页全量扫描"
+      ]
+    }
+  ]
+}

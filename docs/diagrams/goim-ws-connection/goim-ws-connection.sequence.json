@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "GoIM WebSocket 连接建立与在线状态维持",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1020, 700],
+    "column_fit": "spread",
+    "animation": "trace",
+    "views": [
+      {
+        "id": "handshake",
+        "label": "握手与鉴权",
+        "focus": ["browser", "gateway"],
+        "note": "浏览器经查询参数携带 JWT 请求升级，网关校验令牌后建立连接。"
+      },
+      {
+        "id": "single-device",
+        "label": "单设备踢出",
+        "focus": ["old-client", "gateway"],
+        "note": "同账号新连接注册时向旧连接发送 kick 帧并替换连接表条目。"
+      },
+      {
+        "id": "presence",
+        "label": "在线状态维持",
+        "focus": ["gateway", "redis"],
+        "note": "在线与连接键 TTL 均为 60 秒，由 20 秒心跳续期，断连即删除。"
+      }
+    ]
+  },
+  "participants": [
+    { "id": "browser", "type": "external", "label": "浏览器", "sublabel": "新连接" },
+    { "id": "gateway", "type": "backend", "label": "WS 网关", "sublabel": "升级 · 连接管理" },
+    { "id": "old-client", "type": "external", "label": "同账号旧连接", "sublabel": "被踢出设备" },
+    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "在线键", "brand": "redis" }
+  ],
+  "segments": [
+    { "from": 150, "to": 264, "label": "握手与鉴权" },
+    { "from": 272, "to": 356, "label": "单设备踢出" },
+    { "from": 364, "to": 560, "label": "在线状态维持" }
+  ],
+  "messages": [
+    { "id": "ws-upgrade", "from": "browser", "to": "gateway", "y": 160, "label": "GET /ws?token=JWT", "variant": "security" },
+    { "id": "parse-jwt", "from": "gateway", "to": "browser", "y": 200, "label": "校验令牌签名与有效期", "variant": "security" },
+    { "id": "upgraded", "from": "gateway", "to": "browser", "y": 240, "label": "101 切换协议", "variant": "return" },
+    { "id": "kick-old", "from": "gateway", "to": "old-client", "y": 290, "label": "kick 帧：new_login", "variant": "emphasis" },
+    { "id": "kick-close", "from": "old-client", "to": "gateway", "y": 326, "label": "旧连接关闭", "variant": "return" },
+    { "id": "register-conn", "from": "gateway", "to": "browser", "y": 362, "label": "注册新连接（单设备）", "variant": "default" },
+    { "id": "set-online", "from": "gateway", "to": "redis", "y": 392, "label": "SET online 键 TTL 60s", "variant": "emphasis" },
+    { "id": "set-conn", "from": "gateway", "to": "redis", "y": 424, "label": "SET conn 键 TTL 60s", "variant": "emphasis" },
+    { "id": "start-pumps", "from": "gateway", "to": "browser", "y": 454, "label": "启动读写协程", "variant": "default" },
+    { "id": "heartbeat", "from": "gateway", "to": "redis", "y": 484, "label": "每 20 秒续期在线键", "variant": "dashed", "note": "在线状态由连接存活决定而非握手时刻" },
+    { "id": "del-online", "from": "gateway", "to": "redis", "y": 514, "label": "连接关闭后删除在线键", "variant": "emphasis" }
+  ],
+  "activations": [
+    { "participant": "gateway", "from": 166, "to": 516, "type": "backend" },
+    { "participant": "redis", "from": 388, "to": 490, "type": "database" },
+    { "participant": "old-client", "from": 286, "to": 330, "type": "external" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "握手契约",
+      "items": [
+        "JWT 通过查询参数传入，签名与有效期在升级前校验",
+        "令牌无效时直接返回 401，不建立长连接"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "单设备策略",
+      "items": [
+        "新连接注册时向同账号旧连接发送 kick 帧",
+        "连接表以 userID 为键，旧条目先删除再写入新连接"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "在线状态",
+      "items": [
+        "online 与 conn 键 TTL 均为 60 秒，由 20 秒心跳续期",
+        "连接关闭时立即删除在线键，避免僵尸在线"
+      ]
+    }
+  ]
+}
