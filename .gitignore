@@ -1,7 +1,6 @@
 # Go build artifacts
 *.exe
 *.test
-server
 *.out
 coverage.out
 
