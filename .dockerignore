@@ -1,0 +1,11 @@
+.git
+.github
+**/node_modules
+frontend/dist
+backend/uploads
+backend/server
+backend/server.*.log
+backend/configs/config.local.yaml
+**/.env
+**/.env.*
+*.md

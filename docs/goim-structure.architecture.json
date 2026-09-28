@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "GoIM 项目结构与运行时架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1300, 640],
+    "views": [
+      {
+        "id": "client-path",
+        "label": "客户端入口",
+        "focus": ["browser", "react-spa", "http-api", "ws-gateway"],
+        "note": "React SPA 分别通过 REST API 与 WebSocket 长连接接入后端。"
+      },
+      {
+        "id": "message-path",
+        "label": "消息链路",
+        "focus": ["ws-gateway", "services", "redis", "kafka", "consumers", "mysql"],
+        "note": "写操作先在 Redis 中原子完成，再经 Kafka 异步消费并落库到 MySQL。"
+      },
+      {
+        "id": "backend-layers",
+        "label": "后端分层",
+        "focus": ["http-api", "ws-gateway", "services", "consumers"],
+        "note": "Gin Handler、WebSocket 网关、Service 与 Consumer 各自承担清晰职责。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "Web 用户",
+      "sublabel": "浏览器",
+      "pos": [40, 264],
+      "size": [130, 72]
+    },
+    {
+      "id": "react-spa",
+      "type": "frontend",
+      "label": "React SPA",
+      "sublabel": "页面 · 状态 · API · 实时通知",
+      "tag": "frontend/src",
+      "pos": [220, 264],
+      "size": [188, 72]
+    },
+    {
+      "id": "http-api",
+      "type": "backend",
+      "label": "Gin REST API",
+      "sublabel": "鉴权 · 好友 · 群组 · 动态 · 设置",
+      "tag": "internal/api",
+      "pos": [480, 150],
+      "size": [196, 76]
+    },
+    {
+      "id": "ws-gateway",
+      "type": "backend",
+      "label": "WebSocket 网关",
+      "sublabel": "连接管理 · 收发 · 离线同步 · Ack",
+      "tag": "internal/ws + conn",
+      "pos": [480, 400],
+      "size": [196, 76]
+    },
+    {
+      "id": "services",
+      "type": "backend",
+      "label": "业务服务层",
+      "sublabel": "领域规则与仓储编排",
+      "tag": "internal/service",
+      "pos": [740, 264],
+      "size": [180, 76]
+    },
+    {
+      "id": "redis",
+      "type": "database",
+      "label": "Redis 7.2",
+      "sublabel": "热数据 · 收发箱 · 未读 · Lua",
+      "tag": "Redis-first",
+      "brand": "redis",
+      "pos": [1010, 96],
+      "size": [196, 76]
+    },
+    {
+      "id": "kafka",
+      "type": "messagebus",
+      "label": "Kafka 3.7",
+      "sublabel": "持久化与动态异步事件",
+      "brand": "kafka",
+      "pos": [1010, 264],
+      "size": [196, 76]
+    },
+    {
+      "id": "mysql",
+      "type": "database",
+      "label": "MySQL 8.4",
+      "sublabel": "用户 · 关系 · 消息 · 群组 · 动态",
+      "brand": "mysql",
+      "pos": [1010, 500],
+      "size": [196, 76]
+    },
+    {
+      "id": "consumers",
+      "type": "backend",
+      "label": "异步消费者",
+      "sublabel": "消息持久化 · 动态扇出 · 点赞落库",
+      "tag": "internal/consumer",
+      "pos": [1010, 382],
+      "size": [196, 76]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Go 后端进程",
+      "wraps": ["http-api", "ws-gateway", "services", "consumers"],
+      "pad": 24
+    },
+    {
+      "kind": "region",
+      "label": "Docker Compose 基础设施",
+      "wraps": ["redis", "kafka", "mysql"],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {
+      "id": "user-opens-spa",
+      "from": "browser",
+      "to": "react-spa",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "id": "spa-calls-api",
+      "from": "react-spa",
+      "to": "http-api",
+      "label": "REST + JWT",
+      "variant": "security"
+    },
+    {
+      "id": "spa-connects-ws",
+      "from": "react-spa",
+      "to": "ws-gateway",
+      "label": "WebSocket + JWT",
+      "variant": "security"
+    },
+    {
+      "id": "api-invokes-services",
+      "from": "http-api",
+      "to": "services",
+      "label": "同步调用"
+    },
+    {
+      "id": "ws-invokes-services",
+      "from": "ws-gateway",
+      "to": "services",
+      "label": "消息处理"
+    },
+    {
+      "id": "services-use-redis",
+      "from": "services",
+      "to": "redis",
+      "label": "缓存与原子操作",
+      "variant": "emphasis",
+      "labelDy": -26
+    },
+    {
+      "id": "services-publish-events",
+      "from": "services",
+      "to": "kafka",
+      "label": "发布异步事件",
+      "labelDy": 22
+    },
+    {
+      "id": "mq-delivers-events",
+      "from": "kafka",
+      "to": "consumers",
+      "label": "消费事件",
+      "labelAt": [1155, 350]
+    },
+    {
+      "id": "consumers-persist-mysql",
+      "from": "consumers",
+      "to": "mysql",
+      "label": "异步持久化",
+      "variant": "emphasis",
+      "labelAt": [1165, 472]
+    },
+    {
+      "id": "services-read-mysql",
+      "from": "services",
+      "to": "mysql",
+      "label": "关系数据与回源",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "labelDx": -30
+    },
+    {
+      "id": "consumers-update-redis",
+      "from": "consumers",
+      "to": "redis",
+      "label": "收发箱与时间线",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "right",
+      "via": [[1288, 420], [1288, 134]]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "前端结构",
+      "items": [
+        "pages / components 组织界面与路由",
+        "api / stores / realtime 分别承接请求、状态与实时消息"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "核心架构取向",
+      "items": [
+        "Redis-first 保证聊天热路径与 Lua 原子性",
+        "Kafka 解耦消息处理、动态扇出与 MySQL 持久化"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "工程与交付",
+      "items": [
+        "Docker Compose 承载 MySQL / Redis / Kafka 与 Kafka UI",
+        "GitHub Actions 构建并发布 GHCR 镜像"
+      ]
+    }
+  ]
+}
