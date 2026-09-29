@@ -25,6 +25,8 @@ type MomentFeedConsumer struct {
 	bigUserThreshold int
 	// timelineMaxLen 是每个收件箱/寄件箱扇出后裁剪保留的最大条数。
 	timelineMaxLen int
+
+	dlq DeadLetterPolicy
 }
 
 // NewMomentFeedConsumer 创建一个新的 MomentFeedConsumer。
@@ -40,13 +42,19 @@ func NewMomentFeedConsumer(reader *kafka.Reader, mysqlRepo repository.MySQLRepo,
 	}
 }
 
+// WithDeadLetter 设置重试上限与死信 Topic；不调用则失败消息一直原地重试。
+func (c *MomentFeedConsumer) WithDeadLetter(p DeadLetterPolicy) *MomentFeedConsumer {
+	c.dlq = p
+	return c
+}
+
 // Start 在后台 goroutine 中开始从 moment_push Topic 消费。
 func (c *MomentFeedConsumer) Start(ctx context.Context) error {
 	if err := requireReader(c.reader, "moment feed consumer"); err != nil {
 		return err
 	}
 	c.logger.Info("动态消息消费者已启动")
-	go runReader(ctx, c.reader, c.logger, "moment-feed", c.handleMessage)
+	go runReader(ctx, c.reader, c.logger, "moment-feed", c.handleMessage, c.dlq)
 	return nil
 }
 

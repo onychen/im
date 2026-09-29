@@ -54,6 +54,9 @@ type KafkaConfig struct {
 	ReplicationFactor int `yaml:"replication_factor"`
 	// StartOffset 是消费者组首次启动时的起始位置："earliest"（默认）或 "latest"。
 	StartOffset string `yaml:"start_offset"`
+	// CommitIntervalMs 是 offset 异步提交间隔（毫秒）。未配置或为 0 时默认 1000；
+	// 设为负数表示每条消息同步提交（吞吐较低，仅用于调试）。
+	CommitIntervalMs int `yaml:"commit_interval_ms"`
 }
 
 // StringList 同时支持 YAML 序列和逗号分隔字符串两种写法。
@@ -158,6 +161,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Kafka.StartOffset == "" {
 		cfg.Kafka.StartOffset = "earliest"
+	}
+	if cfg.Kafka.CommitIntervalMs == 0 {
+		cfg.Kafka.CommitIntervalMs = 1000
 	}
 
 	// 朋友圈 Feed 默认值（未配置时生效）

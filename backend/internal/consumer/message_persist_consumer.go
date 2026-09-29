@@ -71,8 +71,10 @@ func (c *MessagePersistConsumer) Start(ctx context.Context) error {
 	if c.writer == nil {
 		return fmt.Errorf("message persist consumer writer is nil")
 	}
-	go runReader(ctx, c.reader, c.logger, "message-persist", c.handle)
-	go runReader(ctx, c.retryReader, c.logger, "message-persist-retry", c.handleRetry)
+	// 主 Topic 自带 retry Topic + DLQ；这里只有转投失败才会原地重试，必须重试到成功，
+	// 因此不启用通用死信策略（零值）。
+	go runReader(ctx, c.reader, c.logger, "message-persist", c.handle, DeadLetterPolicy{})
+	go runReader(ctx, c.retryReader, c.logger, "message-persist-retry", c.handleRetry, DeadLetterPolicy{})
 	c.logger.Info("message persistence consumer started")
 	return nil
 }

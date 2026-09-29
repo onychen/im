@@ -21,8 +21,8 @@ go mod tidy
 | Queue（durable） | Topic，由 `infra.KafkaClient.EnsureTopics` 启动时创建 |
 | Publisher confirm | `Writer{RequiredAcks: RequireAll, Async: false}`，`WriteMessages` 返回 nil 即确认 |
 | 独立 confirm channel | relay 使用独立的 `persistWriter`，与动态、点赞的 Writer 隔离 |
-| Consumer + 手动 ack | 消费者组 Reader，`CommitInterval=0`，处理成功后同步 `CommitMessages` |
-| nack requeue | 分区内指数退避重试（200ms 到 10s），直到成功或 ctx 取消 |
+| Consumer + 手动 ack | 消费者组 Reader，处理成功后 `CommitMessages` 登记，按 `commit_interval_ms`（默认 1s）异步批量提交 |
+| nack requeue | 分区内指数退避重试（200ms 到 10s），默认 10 次后转投 `<topic>_dlq` |
 | reject（不重入队） | handler 返回 `drop(err)`，记录日志后提交 offset |
 | TTL 延迟队列 + DLX | `message_persist_retry` Topic，header 带 `x-retry-at`、`x-retry-count`，到期后回流主 Topic |
 | 死信队列 | `message_persist_dlq`，重试超过 5 次写入 |
@@ -35,8 +35,8 @@ go mod tidy
 
 ## 4. 语义差异（需要关注）
 
-1. 分区内阻塞：某条消息持续失败时，会阻塞同分区后续消息（RabbitMQ 版会把它放回队尾继续处理其他消息）。`message_persist` 通过 retry Topic 规避了这个问题；其余消费者依赖退避重试，异常数据应返回 `drop`。
-2. 至少一次：offset 在处理成功后才提交，进程崩溃或 rebalance 时可能重复消费，消费端需要幂等。原有的 `serverMsgId` 幂等落库保持不变。
+1. 分区内阻塞：某条消息持续失败时，会短暂阻塞同分区后续消息。`message_persist` 通过 retry Topic 规避；其余消费者重试 10 次（约 40s）后转投 `private_msg_persist_dlq` / `group_msg_fanout_dlq` / `moment_push_dlq` / `like_persist_dlq`，header 带原 topic/partition/offset 与最后错误，可人工回放。
+2. 至少一次：offset 异步提交，进程崩溃或 rebalance 时最多重复消费约一个提交间隔的消息，消费端需要幂等。原有的 `serverMsgId` 幂等落库保持不变。
 3. 点赞批量：`like_persist` 拆成 fetch 和 batch 两个 goroutine，整批写库成功后一次性提交该批 offset。
 4. 服务不再因 MQ 断连退出，watchdog 仍然作为兜底保留。
 
@@ -50,6 +50,7 @@ kafka:
   partitions: 3
   replication_factor: 1
   start_offset: earliest         # earliest | latest
+  commit_interval_ms: 1000       # offset 异步提交间隔；负数表示每条同步提交
 ```
 
 本地 compose：Kafka `localhost:19092`（容器内 `kafka:9092`），Kafka UI `http://localhost:18081`。

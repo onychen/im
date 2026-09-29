@@ -31,6 +31,8 @@ type LikePersistConsumer struct {
 
 	batchSize     int
 	flushInterval time.Duration
+
+	dlq DeadLetterPolicy
 }
 
 // NewLikePersistConsumer 创建 LikePersistConsumer。
@@ -49,6 +51,12 @@ func NewLikePersistConsumer(reader *kafka.Reader, mysqlRepo repository.MySQLRepo
 		batchSize:     batchSize,
 		flushInterval: time.Duration(flushMs) * time.Millisecond,
 	}
+}
+
+// WithDeadLetter 设置整批重试上限与死信 Topic；不调用则失败批次一直退避重试。
+func (c *LikePersistConsumer) WithDeadLetter(p DeadLetterPolicy) *LikePersistConsumer {
+	c.dlq = p
+	return c
 }
 
 // Start 开始从 like_persist Topic 消费。拉取与攒批分别在两个 goroutine 中运行。
@@ -133,26 +141,34 @@ func (c *LikePersistConsumer) runBatcher(ctx context.Context, messages <-chan ka
 	}
 }
 
-// flushWithRetry 反复尝试落库并提交 offset，直到成功或 ctx 结束。
+// flushWithRetry 反复尝试落库并提交 offset，直到成功、达到上限转投 DLQ 或 ctx 结束。
 func (c *LikePersistConsumer) flushWithRetry(ctx context.Context, batch []kafka.Message) {
 	backoff := retryBackoffMin
-	for {
+	for attempt := 1; ; attempt++ {
 		err := c.flush(ctx, batch)
 		if err == nil {
-			if err := c.reader.CommitMessages(ctx, batch...); err != nil {
-				c.logger.Warn("提交点赞事件 offset 失败（重启后将重复消费，落库幂等）", zap.Error(err))
+			c.commit(ctx, batch)
+			return
+		}
+		if c.dlq.enabled() && attempt >= c.dlq.MaxAttempts {
+			// 整批写入 DLQ 成功后才提交 offset；ctx 取消则不提交，重启后重新消费。
+			if publishDeadLetter(ctx, c.logger, "like-persist", c.dlq, attempt, err, batch...) {
+				c.commit(ctx, batch)
 			}
 			return
 		}
 		c.logger.Error("批量落库点赞失败，整批退避重试",
-			zap.Int("events", len(batch)), zap.Duration("backoff", backoff), zap.Error(err))
+			zap.Int("events", len(batch)), zap.Int("attempt", attempt), zap.Duration("backoff", backoff), zap.Error(err))
 		if !sleepCtx(ctx, backoff) {
 			return
 		}
-		backoff *= 2
-		if backoff > retryBackoffMax {
-			backoff = retryBackoffMax
-		}
+		backoff = nextBackoff(backoff)
+	}
+}
+
+func (c *LikePersistConsumer) commit(ctx context.Context, batch []kafka.Message) {
+	if err := c.reader.CommitMessages(ctx, batch...); err != nil {
+		c.logger.Warn("提交点赞事件 offset 失败（重启后将重复消费，落库幂等）", zap.Error(err))
 	}
 }
 

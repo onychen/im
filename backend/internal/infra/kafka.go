@@ -25,6 +25,12 @@ const (
 	TopicMomentPush          = "moment_push"
 	TopicLikePersist         = "like_persist"
 	TopicCommentPersist      = "comment_persist"
+
+	// 通用死信 Topic：对应消费者重试达到上限后转投，保留原消息与失败原因供人工排查/回放。
+	TopicPrivateMsgPersistDLQ = "private_msg_persist_dlq"
+	TopicGroupMsgFanoutDLQ    = "group_msg_fanout_dlq"
+	TopicMomentPushDLQ        = "moment_push_dlq"
+	TopicLikePersistDLQ       = "like_persist_dlq"
 )
 
 // TopicNames 列出 IM 系统所需的所有 Topic。
@@ -37,6 +43,10 @@ var TopicNames = []string{
 	TopicMomentPush,
 	TopicLikePersist,
 	TopicCommentPersist,
+	TopicPrivateMsgPersistDLQ,
+	TopicGroupMsgFanoutDLQ,
+	TopicMomentPushDLQ,
+	TopicLikePersistDLQ,
 }
 
 // ── 消费者组名称（会拼接 config.Kafka.GroupPrefix）──
@@ -217,8 +227,9 @@ func (c *KafkaClient) NewWriter() *kafka.Writer {
 }
 
 // NewReader 为指定 Topic 创建消费者组 Reader。
-// CommitInterval=0 表示 CommitMessages 同步提交，业务处理成功后才前移 offset，
-// 等价于 RabbitMQ 的手动 ack。
+// offset 采用 kafka-go 推荐的异步定时提交：业务处理成功后调用 CommitMessages 只是登记，
+// 由后台每 CommitInterval 批量提交一次，Reader.Close 时会把剩余 offset 刷出。
+// 进程崩溃时最多重复消费一个提交间隔内的消息，消费端均已幂等。
 func (c *KafkaClient) NewReader(topic, group string) *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
 		Brokers:           c.cfg.Brokers,
@@ -228,13 +239,25 @@ func (c *KafkaClient) NewReader(topic, group string) *kafka.Reader {
 		MinBytes:          1,
 		MaxBytes:          10 << 20,
 		MaxWait:           500 * time.Millisecond,
-		CommitInterval:    0,
+		CommitInterval:    c.commitInterval(),
 		StartOffset:       c.startOffset(),
 		HeartbeatInterval: 3 * time.Second,
 		SessionTimeout:    30 * time.Second,
 		ReadBackoffMin:    100 * time.Millisecond,
 		ReadBackoffMax:    time.Second,
 	})
+}
+
+// commitInterval：0 取默认 1s；负数表示同步提交（kafka-go 中 CommitInterval=0 即同步）。
+func (c *KafkaClient) commitInterval() time.Duration {
+	switch {
+	case c.cfg.CommitIntervalMs < 0:
+		return 0
+	case c.cfg.CommitIntervalMs == 0:
+		return time.Second
+	default:
+		return time.Duration(c.cfg.CommitIntervalMs) * time.Millisecond
+	}
 }
 
 func (c *KafkaClient) startOffset() int64 {

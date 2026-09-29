@@ -38,6 +38,7 @@ type GroupMsgConsumer struct {
 	redisRepo repository.RedisRepo
 	cm        *conn.ConnectionManager
 	logger    *zap.Logger
+	dlq       DeadLetterPolicy
 }
 
 // NewGroupMsgConsumer 创建一个新的 GroupMsgConsumer。
@@ -51,14 +52,20 @@ func NewGroupMsgConsumer(reader *kafka.Reader, mysqlRepo repository.MySQLRepo, r
 	}
 }
 
+// WithDeadLetter 设置重试上限与死信 Topic；不调用则失败消息一直原地重试。
+func (c *GroupMsgConsumer) WithDeadLetter(p DeadLetterPolicy) *GroupMsgConsumer {
+	c.dlq = p
+	return c
+}
+
 // Start 在后台 goroutine 中开始消费 group_msg_fanout Topic。
-// 处理成功才提交 offset；临时失败在分区内退避重试（同群消息保持有序）。
+// 处理成功才提交 offset；临时失败在分区内退避重试（同群消息保持有序），达到上限转投 DLQ。
 func (c *GroupMsgConsumer) Start(ctx context.Context) error {
 	if err := requireReader(c.reader, "group msg consumer"); err != nil {
 		return err
 	}
 	c.logger.Info("群消息消费者已启动")
-	go runReader(ctx, c.reader, c.logger, "group-msg", c.handleMessage)
+	go runReader(ctx, c.reader, c.logger, "group-msg", c.handleMessage, c.dlq)
 	return nil
 }
 

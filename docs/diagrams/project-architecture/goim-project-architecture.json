@@ -6,9 +6,9 @@
     "locale": "zh-CN",
     "quality_profile": "showcase",
     "repository": {
-      "url": "https://github.com/Johnny-Cheung/IM.git",
+      "url": "https://github.com/onychen/im.git",
       "provider": "github",
-      "revision": "3c339fdb81408c92a0b31c5396e59ae8f2b9ebed"
+      "revision": "2d86f2ccb4317c4fa46c68ecca31c0a20a405fd4"
     },
     "viewBox": [1240, 760],
     "views": [
@@ -61,8 +61,8 @@
       "sublabel": "鉴权 · 好友 · 群组 · 动态 · 设置",
       "tag": "internal/api",
       "sources": [
-        { "path": "backend/cmd/server/main.go", "label": "服务装配与路由" },
-        { "path": "backend/internal/api/auth_handler.go", "label": "HTTP Handler 示例" }
+        { "path": "backend/internal/api/auth_handler.go", "label": "鉴权 Handler" },
+        { "path": "backend/internal/api/moment_handler.go", "label": "业务 Handler 示例" }
       ],
       "pos": [455, 185],
       "size": [190, 76]

@@ -5166,12 +5166,12 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <path data-edge-from="react-spa" data-edge-to="ws-gateway" data-edge-label="WebSocket + JWT" data-edge-key="2" data-edge-id="spa-connects-ws" data-composition-points="408,307;444,307;444,438;480,438" d="M 408 307 L 436 307 Q 444 307 444 315 L 444 430 Q 444 438 452 438 L 480 438" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
         <path data-edge-from="http-api" data-edge-to="services" data-edge-label="同步调用" data-edge-key="3" data-edge-id="api-invokes-services" data-composition-points="676,188;708,188;708,295;740,295" d="M 676 188 L 700 188 Q 708 188 708 196 L 708 287 Q 708 295 716 295 L 740 295" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="ws-gateway" data-edge-to="services" data-edge-label="消息处理" data-edge-key="4" data-edge-id="ws-invokes-services" data-composition-points="676,438;708,438;708,309;740,309" d="M 676 438 L 700 438 Q 708 438 708 430 L 708 317 Q 708 309 716 309 L 740 309" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="services" data-edge-to="redis" data-edge-label="缓存与原子操作" data-edge-key="5" data-edge-id="services-use-redis" data-composition-points="920,295;965,295;965,134;1010,134" d="M 920 295 L 957 295 Q 965 295 965 287 L 965 142 Q 965 134 973 134 L 1010 134" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="services" data-edge-to="kafka" data-edge-label="发布异步事件" data-edge-key="6" data-edge-id="services-publish-events" data-composition-points="920,309;1010,309" d="M 920 309 L 1010 309" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="services" data-edge-to="redis" data-edge-label="缓存与原子操作" data-edge-key="5" data-edge-id="services-use-redis" data-composition-points="920,302;965,302;965,134;1010,134" d="M 920 302 L 957 302 Q 965 302 965 294 L 965 142 Q 965 134 973 134 L 1010 134" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="services" data-edge-to="kafka" data-edge-label="发布异步事件（动态/点赞）" data-edge-key="6" data-edge-id="services-publish-events" data-composition-points="920,302;1010,302" d="M 920 302 L 1010 302" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="kafka" data-edge-to="consumers" data-edge-label="消费事件" data-edge-key="7" data-edge-id="mq-delivers-events" data-composition-points="1108,340;1108,382" d="M 1108 340 L 1108 382" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="consumers" data-edge-to="mysql" data-edge-label="异步持久化" data-edge-key="8" data-edge-id="consumers-persist-mysql" data-composition-points="1108,458;1108,500" d="M 1108 458 L 1108 500" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="services" data-edge-to="mysql" data-edge-label="关系数据与回源" data-edge-key="9" data-edge-id="services-read-mysql" data-composition-points="830,340;830,600;1108,600;1108,576" d="M 830 340 L 830 592 Q 830 600 838 600 L 1100 600 Q 1108 600 1108 592 L 1108 576" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="consumers" data-edge-to="redis" data-edge-label="收发箱与时间线" data-edge-key="10" data-edge-id="consumers-update-redis" data-composition-points="1206,420;1288,420;1288,134;1206,134" d="M 1206 420 L 1280 420 Q 1288 420 1288 412 L 1288 142 Q 1288 134 1280 134 L 1206 134" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="consumers" data-edge-to="redis" data-edge-label="动态时间线与扇出" data-edge-key="10" data-edge-id="consumers-update-redis" data-composition-points="1206,420;1288,420;1288,134;1206,134" d="M 1206 420 L 1280 420 Q 1288 420 1288 412 L 1288 142 Q 1288 134 1280 134 L 1206 134" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
 
         <!-- Components -->
         <g id="node-browser" data-node-id="browser" data-node-label="Web 用户" tabindex="0" role="button" aria-label="聚焦Web 用户，浏览器, 架构组件" aria-pressed="false" data-node-kind="external" data-node-sublabel="浏览器" data-node-context="架构组件">
@@ -5325,12 +5325,12 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <text x="708" y="363.5" class="t-muted" font-size="8" text-anchor="middle">消息处理</text>
         </g>
         <g data-detail="context" data-edge-from="services" data-edge-to="redis" data-edge-label="缓存与原子操作" data-edge-key="5" data-edge-id="services-use-redis">
-          <rect x="926.4" y="168.5" width="77.2" height="14" rx="3" class="c-mask"/>
-          <text x="965" y="178.5" class="t-backend" font-size="8" text-anchor="middle">缓存与原子操作</text>
+          <rect x="926.4" y="172" width="77.2" height="14" rx="3" class="c-mask"/>
+          <text x="965" y="182" class="t-backend" font-size="8" text-anchor="middle">缓存与原子操作</text>
         </g>
-        <g data-detail="context" data-edge-from="services" data-edge-to="kafka" data-edge-label="发布异步事件" data-edge-key="6" data-edge-id="services-publish-events">
-          <rect x="931.2" y="311" width="67.6" height="14" rx="3" class="c-mask"/>
-          <text x="965" y="321" class="t-muted" font-size="8" text-anchor="middle">发布异步事件</text>
+        <g data-detail="context" data-edge-from="services" data-edge-to="kafka" data-edge-label="发布异步事件（动态/点赞）" data-edge-key="6" data-edge-id="services-publish-events">
+          <rect x="900" y="344" width="130" height="14" rx="3" class="c-mask"/>
+          <text x="965" y="354" class="t-muted" font-size="8" text-anchor="middle">发布异步事件（动态/点赞）</text>
         </g>
         <g data-detail="context" data-edge-from="kafka" data-edge-to="consumers" data-edge-label="消费事件" data-edge-key="7" data-edge-id="mq-delivers-events">
           <rect x="1130.8" y="340" width="48.4" height="14" rx="3" class="c-mask"/>
@@ -5344,9 +5344,9 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <rect x="900.4" y="580" width="77.2" height="14" rx="3" class="c-mask"/>
           <text x="939" y="590" class="t-messagebus" font-size="8" text-anchor="middle">关系数据与回源</text>
         </g>
-        <g data-detail="context" data-edge-from="consumers" data-edge-to="redis" data-edge-label="收发箱与时间线" data-edge-key="10" data-edge-id="consumers-update-redis">
-          <rect x="1249.4" y="257" width="77.2" height="14" rx="3" class="c-mask"/>
-          <text x="1288" y="267" class="t-messagebus" font-size="8" text-anchor="middle">收发箱与时间线</text>
+        <g data-detail="context" data-edge-from="consumers" data-edge-to="redis" data-edge-label="动态时间线与扇出" data-edge-key="10" data-edge-id="consumers-update-redis">
+          <rect x="1244.6" y="257" width="86.8" height="14" rx="3" class="c-mask"/>
+          <text x="1288" y="267" class="t-messagebus" font-size="8" text-anchor="middle">动态时间线与扇出</text>
         </g>
 
         <!-- Boundary labels (foreground masks keep routes out of titles) -->

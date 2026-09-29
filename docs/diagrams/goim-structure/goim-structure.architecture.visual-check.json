@@ -6,9 +6,9 @@
   "status": "pass",
   "visualReview": "pending",
   "artifact": {
-    "path": "D:\\code\\easy-chat\\docs\\goim-structure.architecture.html",
-    "sha256": "1f50bc035837294e5ab2c9734fd80babeac598617e7e5645d62d9c6219fe9a4c",
-    "bytes": 821796
+    "path": "D:\\code\\easy-chat\\docs\\diagrams\\goim-structure\\goim-structure.architecture.html",
+    "sha256": "3ef3387c61d033eb99cd08f55a35ff557f80af55818b680a3195be4d22cd4d06",
+    "bytes": 821855
   },
   "state": {
     "detail": "read",

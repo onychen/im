@@ -170,8 +170,8 @@
       "id": "services-publish-events",
       "from": "services",
       "to": "kafka",
-      "label": "发布异步事件",
-      "labelDy": 22
+      "label": "发布异步事件（动态/点赞）",
+      "labelAt": [965, 354]
     },
     {
       "id": "mq-delivers-events",
@@ -202,7 +202,7 @@
       "id": "consumers-update-redis",
       "from": "consumers",
       "to": "redis",
-      "label": "收发箱与时间线",
+      "label": "动态时间线与扇出",
       "variant": "dashed",
       "fromSide": "right",
       "toSide": "right",

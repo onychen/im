@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "GoIM 消息发送与投递时序",
+    "locale": "zh-CN",
+    "subtitle": "发送方 → Lua 原子写入 → Redis Stream → relay 中继 → Kafka → 持久化消费者 → MySQL",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 594],
+    "column_fit": "spread",
+    "animation": "trace",
+    "views": [
+      {
+        "id": "send-and-atomic",
+        "label": "发送与原子写入",
+        "focus": ["sender", "gateway", "redis"],
+        "note": "上行消息经单次 Lua 原子完成校验、ID 分配、收发箱、会话与未读写入，并 XADD 进持久化 Stream。"
+      },
+      {
+        "id": "relay-and-ack",
+        "label": "中继与确认",
+        "focus": ["gateway", "redis", "kafka", "sender"],
+        "note": "relay 从 Stream 读取事件并发布到 Kafka，拿到 ISR 确认后才向发送方回 serverAck。"
+      },
+      {
+        "id": "deliver",
+        "label": "实时投递",
+        "focus": ["gateway", "sender", "receiver"],
+        "note": "Kafka 确认后向在线接收方推送消息；离线用户由上线后的同步补齐。"
+      },
+      {
+        "id": "async-persist",
+        "label": "异步持久化",
+        "focus": ["consumer", "kafka", "mysql"],
+        "note": "消费者幂等落库到 MySQL；失败转 retry Topic，重试 5 次后进入 DLQ。"
+      }
+    ]
+  },
+  "participants": [
+    { "id": "sender", "type": "external", "label": "发送方", "sublabel": "Web 端" },
+    { "id": "gateway", "type": "backend", "label": "WS 网关/relay", "sublabel": "连接 · Lua · Stream 中继" },
+    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "收发箱 · Stream", "brand": "redis" },
+    { "id": "kafka", "type": "messagebus", "label": "Kafka", "sublabel": "message_persist", "brand": "kafka" },
+    { "id": "consumer", "type": "backend", "label": "持久化消费者", "sublabel": "幂等落库" },
+    { "id": "mysql", "type": "database", "label": "MySQL", "sublabel": "历史消息", "brand": "mysql" },
+    { "id": "receiver", "type": "external", "label": "接收方", "sublabel": "在线用户" }
+  ],
+  "segments": [
+    { "from": 150, "to": 238, "label": "发送与原子写入" },
+    { "from": 246, "to": 322, "label": "Stream 中继与确认" },
+    { "from": 330, "to": 390, "label": "实时投递" },
+    { "from": 398, "to": 502, "label": "异步持久化与重试" }
+  ],
+  "messages": [
+    { "id": "send-frame", "from": "sender", "to": "gateway", "y": 160, "label": "send_message 帧", "variant": "emphasis", "note": "连接在升级时已完成 JWT 校验" },
+    { "id": "lua-write", "from": "gateway", "to": "redis", "y": 190, "label": "Lua：校验+ID+收发箱+会话+未读", "variant": "emphasis", "note": "单次原子完成；消息 ID 基于 Redis TIME 毫秒+毫内序号" },
+    { "id": "lua-ack", "from": "redis", "to": "gateway", "y": 222, "label": "msg_id · event_id（已 XADD 入 Stream）", "variant": "return" },
+    { "id": "relay-claim", "from": "gateway", "to": "redis", "y": 254, "label": "relay 读取 Stream", "variant": "default", "note": "失败条目留 pending 由 XAUTOCLAIM 重试，超龄入失败待办重放" },
+    { "id": "relay-publish", "from": "gateway", "to": "kafka", "y": 286, "label": "发布 message_persist", "variant": "emphasis" },
+    { "id": "stream-ack", "from": "gateway", "to": "redis", "y": 314, "label": "XACK / XDEL Stream 条目", "variant": "return" },
+    { "id": "server-ack", "from": "gateway", "to": "sender", "y": 344, "label": "serverAck + msg_id", "variant": "return", "note": "Kafka 确认后才回 Ack" },
+    { "id": "push-receiver", "from": "gateway", "to": "receiver", "y": 374, "label": "推送在线消息", "variant": "default" },
+    { "id": "consume", "from": "kafka", "to": "consumer", "y": 404, "label": "消费事件", "variant": "default" },
+    { "id": "persist", "from": "consumer", "to": "mysql", "y": 434, "label": "幂等插入 messages 表", "variant": "emphasis" },
+    { "id": "mysql-ok", "from": "mysql", "to": "consumer", "y": 462, "label": "落库确认", "variant": "return" },
+    { "id": "retry-dlq", "from": "consumer", "to": "kafka", "y": 490, "label": "失败 → retry / DLQ", "variant": "dashed", "note": "重试 5 次仍失败则进入死信 Topic" }
+  ],
+  "activations": [
+    { "participant": "gateway", "from": 170, "to": 384, "type": "backend" },
+    { "participant": "redis", "from": 184, "to": 320, "type": "database" },
+    { "participant": "kafka", "from": 280, "to": 498, "type": "messagebus" },
+    { "participant": "consumer", "from": 398, "to": 496, "type": "backend" },
+    { "participant": "mysql", "from": 428, "to": 468, "type": "database" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主链路",
+      "items": [
+        "上行帧经网关进入单次 Lua 原子写入，无中间态",
+        "消息 ID 由 Redis TIME 毫秒+毫内序号生成，毫内最多 999 条"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Stream 中继",
+      "items": [
+        "事件先入 Redis Stream，relay 中继到 Kafka 后才 XACK/XDEL",
+        "投递失败超 30 分钟的事件移入失败待办，由重放循环持续补偿"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "异步持久化",
+      "items": [
+        "消费者只负责幂等落库，不再承担收发箱与未读写入",
+        "失败转 retry Topic 延迟回流，重试 5 次后进入 DLQ 隔离"
+      ]
+    }
+  ]
+}

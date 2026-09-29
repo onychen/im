@@ -2,99 +2,92 @@
   "schema_version": 1,
   "diagram_type": "sequence",
   "meta": {
-    "title": "GoIM 消息发送与投递时序",
+    "title": "GoIM 消息发送与投递时序（旧版链路）",
     "locale": "zh-CN",
-    "subtitle": "发送方 → WebSocket 网关 → 服务层 → Redis → Kafka → 消费 → 接收方",
+    "subtitle": "Lua 校验 → 发布 MQ → 消费者扇出：仅在 atomic_pipeline=false 时生效，已被 message-flow 取代",
     "quality_profile": "showcase",
     "viewBox": [1080, 580],
     "column_fit": "spread",
     "animation": "trace",
     "views": [
       {
-        "id": "send-and-auth",
+        "id": "send-and-check",
         "label": "发送与校验",
-        "focus": ["sender", "gateway"],
-        "note": "发送方经 WebSocket 长连接发出消息，网关完成 JWT 与会话校验。"
-      },
-      {
-        "id": "redis-write",
-        "label": "Redis 原子写入",
         "focus": ["sender", "gateway", "redis"],
-        "note": "消息 ID 由 INCR 生成，Lua 脚本原子写入收发箱与未读计数。"
+        "note": "发送方经 WebSocket 长连接发出消息，网关在 Lua 中完成好友、黑名单、去重校验并分配消息 ID。"
       },
       {
-        "id": "async-persist",
-        "label": "异步持久化",
-        "focus": ["gateway", "kafka", "consumer", "mysql"],
-        "note": "网关发布 Kafka 事件，消费者异步落库到 MySQL。"
+        "id": "publish",
+        "label": "发布与扇出",
+        "focus": ["gateway", "kafka", "consumer", "redis"],
+        "note": "网关发布 private_msg_persist 事件，消费者写双方收件箱、会话与未读。"
       },
       {
-        "id": "deliver-ack",
-        "label": "投递与确认",
-        "focus": ["sender", "gateway", "receiver"],
-        "note": "在线接收方实时收到推送，发送方收到服务端 Ack 与消息 ID。"
+        "id": "persist-and-ack",
+        "label": "落库与确认",
+        "focus": ["consumer", "mysql", "sender", "receiver"],
+        "note": "消费者插入 MySQL、推送在线接收方，收件箱写入完成后才回 serverAck。"
       }
     ]
   },
   "participants": [
     { "id": "sender", "type": "external", "label": "发送方", "sublabel": "Web 端" },
     { "id": "gateway", "type": "backend", "label": "WS 网关", "sublabel": "连接 · 服务" },
-    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "收发箱", "brand": "redis" },
-    { "id": "kafka", "type": "messagebus", "label": "Kafka", "sublabel": "异步事件", "brand": "kafka" },
-    { "id": "consumer", "type": "backend", "label": "消费者", "sublabel": "持久化" },
+    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "校验 · 收发箱", "brand": "redis" },
+    { "id": "kafka", "type": "messagebus", "label": "Kafka", "sublabel": "private_msg_persist", "brand": "kafka" },
+    { "id": "consumer", "type": "backend", "label": "私聊消费者", "sublabel": "扇出与落库" },
     { "id": "mysql", "type": "database", "label": "MySQL", "sublabel": "历史消息", "brand": "mysql" },
     { "id": "receiver", "type": "external", "label": "接收方", "sublabel": "在线用户" }
   ],
   "segments": [
-    { "from": 150, "to": 216, "label": "发送与校验" },
-    { "from": 222, "to": 322, "label": "Redis 原子写入" },
-    { "from": 330, "to": 432, "label": "Kafka 异步持久化" },
-    { "from": 440, "to": 512, "label": "投递与确认" }
+    { "from": 150, "to": 232, "label": "发送与校验" },
+    { "from": 240, "to": 330, "label": "发布与扇出" },
+    { "from": 338, "to": 470, "label": "落库与确认" }
   ],
   "messages": [
     { "id": "send-frame", "from": "sender", "to": "gateway", "y": 160, "label": "send_message 帧", "variant": "emphasis", "note": "连接已鉴权：JWT 在升级时校验" },
-    { "id": "gen-msg-id", "from": "gateway", "to": "redis", "y": 228, "label": "INCR msg_id_global", "variant": "emphasis" },
-    { "id": "msg-id", "from": "redis", "to": "gateway", "y": 258, "label": "message_id", "variant": "return" },
-    { "id": "lua-write", "from": "gateway", "to": "redis", "y": 288, "label": "Lua：收发箱 + 未读 + 会话", "variant": "emphasis" },
-    { "id": "lua-ack", "from": "redis", "to": "gateway", "y": 318, "label": "原子写入成功", "variant": "return" },
-    { "id": "publish-persist", "from": "gateway", "to": "kafka", "y": 352, "label": "发布持久化事件", "variant": "emphasis" },
-    { "id": "consume-persist", "from": "kafka", "to": "consumer", "y": 386, "label": "消费事件", "variant": "default" },
-    { "id": "persist-mysql", "from": "consumer", "to": "mysql", "y": 408, "label": "写入 messages 表", "variant": "emphasis" },
-    { "id": "mysql-ok", "from": "mysql", "to": "consumer", "y": 438, "label": "持久化确认", "variant": "return" },
-    { "id": "push-receiver", "from": "gateway", "to": "receiver", "y": 468, "label": "推送消息", "variant": "default" },
-    { "id": "server-ack", "from": "gateway", "to": "sender", "y": 466, "label": "服务端 Ack + message_id", "variant": "return" },
-    { "id": "deliver-ack", "from": "gateway", "to": "sender", "y": 494, "label": "投递回执", "variant": "return" }
+    { "id": "lua-check", "from": "gateway", "to": "redis", "y": 190, "label": "Lua：好友+黑名单+去重+ID 分配", "variant": "emphasis", "note": "消息 ID 基于 Redis TIME 毫秒+毫内序号生成" },
+    { "id": "lua-ack", "from": "redis", "to": "gateway", "y": 220, "label": "msg_id + 在线状态", "variant": "return" },
+    { "id": "publish-persist", "from": "gateway", "to": "kafka", "y": 252, "label": "发布 private_msg_persist 事件", "variant": "emphasis" },
+    { "id": "consume-persist", "from": "kafka", "to": "consumer", "y": 282, "label": "消费事件", "variant": "default" },
+    { "id": "write-inbox", "from": "consumer", "to": "redis", "y": 312, "label": "写双方收件箱+会话+未读", "variant": "emphasis" },
+    { "id": "push-receiver", "from": "consumer", "to": "receiver", "y": 344, "label": "推送在线消息", "variant": "default" },
+    { "id": "persist-mysql", "from": "consumer", "to": "mysql", "y": 374, "label": "写入 messages 表", "variant": "emphasis" },
+    { "id": "mysql-ok", "from": "mysql", "to": "consumer", "y": 402, "label": "持久化确认", "variant": "return" },
+    { "id": "trim-inbox", "from": "consumer", "to": "redis", "y": 430, "label": "裁剪双方收件箱 ZSet", "variant": "dashed" },
+    { "id": "server-ack", "from": "consumer", "to": "sender", "y": 458, "label": "serverAck + message_id", "variant": "return", "note": "收件箱写入与落库完成后才回 Ack" }
   ],
   "activations": [
-    { "participant": "gateway", "from": 170, "to": 502, "type": "backend" },
-    { "participant": "redis", "from": 222, "to": 324, "type": "database" },
-    { "participant": "kafka", "from": 348, "to": 394, "type": "messagebus" },
-    { "participant": "consumer", "from": 382, "to": 452, "type": "backend" },
-    { "participant": "mysql", "from": 408, "to": 448, "type": "database" }
+    { "participant": "gateway", "from": 170, "to": 266, "type": "backend" },
+    { "participant": "redis", "from": 184, "to": 226, "type": "database" },
+    { "participant": "kafka", "from": 246, "to": 290, "type": "messagebus" },
+    { "participant": "consumer", "from": 276, "to": 466, "type": "backend" },
+    { "participant": "mysql", "from": 368, "to": 408, "type": "database" },
+    { "participant": "redis", "from": 304, "to": 436, "type": "database" }
   ],
   "cards": [
     {
       "dot": "cyan",
-      "title": "主链路",
+      "title": "旧版主链路",
       "items": [
-        "发送方帧先经网关完成 JWT 校验",
-        "返回类消息比前向调用更轻，形成清晰节奏"
+        "发送方帧先经 Lua 校验（好友、黑名单、去重）再分配消息 ID",
+        "消息 ID 基于 Redis TIME 毫秒+毫内序号，非全局计数器"
       ]
     },
     {
       "dot": "amber",
-      "title": "Redis 优先",
+      "title": "消费者扇出",
       "items": [
-        "消息 ID 由 INCR 全局生成，保证单调递增",
-        "Lua 脚本把收发箱、未读和会话时间线一次原子写入"
+        "收发箱、会话、未读由 MQ 消费者异步写入 Redis",
+        "失败时在分区内退避重试，成功才提交 offset"
       ]
     },
     {
       "dot": "emerald",
-      "title": "异步持久化",
+      "title": "已被取代",
       "items": [
-        "Kafka 让 MySQL 落库与热路径解耦",
-        "消费者落库失败可重放，不影响即时收发体验"
+        "默认 atomic_pipeline=true 时走 Lua 原子写入+Stream relay 链路",
+        "本图仅在关闭原子管线时生效，参见 message-flow 完整版"
       ]
     }
   ]

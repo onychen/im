@@ -4,28 +4,29 @@
   "meta": {
     "title": "GoIM 群聊广播与成员扇出时序",
     "locale": "zh-CN",
+    "subtitle": "Lua 原子扇出 → Redis Stream → relay 中继 → Kafka → 幂等落库；离线成员经 syncReq 拉取共享发件箱",
     "quality_profile": "showcase",
-    "viewBox": [1080, 940],
+    "viewBox": [1080, 594],
     "column_fit": "spread",
     "animation": "trace",
     "views": [
       {
-        "id": "send-and-check",
-        "label": "发送与成员校验",
+        "id": "send-and-lua",
+        "label": "发送与原子写入",
         "focus": ["sender", "gateway", "redis"],
-        "note": "群消息经 Lua 原子完成成员校验、去重、序号分配与发件箱写入。"
+        "note": "群消息经单次 Lua 原子完成成员校验、去重、群序号分配、共享发件箱与会话列表写入，并 XADD 进持久化 Stream。"
       },
       {
-        "id": "fanout-members",
-        "label": "成员扇出",
-        "focus": ["kafka", "consumer", "redis", "online-member"],
-        "note": "消费者写群组发件箱后逐个更新成员会话列表、未读并推送在线成员。"
+        "id": "relay-and-ack",
+        "label": "中继与确认",
+        "focus": ["gateway", "redis", "kafka", "sender"],
+        "note": "relay 中继事件到 Kafka 并确认后，才向发送方回 serverAck（含群序号），此时消息已可撤回。"
       },
       {
-        "id": "persist-and-ack",
-        "label": "落库与确认",
-        "focus": ["consumer", "mysql", "sender"],
-        "note": "落库并裁剪发件箱后才向发送方回 Ack，保证确认后消息可撤回。"
+        "id": "async-persist",
+        "label": "异步落库",
+        "focus": ["consumer", "kafka", "mysql"],
+        "note": "持久化消费者幂等插入群消息表；群未读采用水位线模型，由读取端计算。"
       },
       {
         "id": "offline-sync",
@@ -37,47 +38,42 @@
   },
   "participants": [
     { "id": "sender", "type": "external", "label": "发送方", "sublabel": "群成员" },
-    { "id": "gateway", "type": "backend", "label": "WS 网关", "sublabel": "连接 · 服务" },
-    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "发件箱 · 成员", "brand": "redis" },
-    { "id": "kafka", "type": "messagebus", "label": "Kafka", "sublabel": "群消息扇出", "brand": "kafka" },
-    { "id": "consumer", "type": "backend", "label": "群消息消费者", "sublabel": "扇出与落库" },
+    { "id": "gateway", "type": "backend", "label": "WS 网关/relay", "sublabel": "连接 · 中继" },
+    { "id": "redis", "type": "database", "label": "Redis", "sublabel": "群发件箱 · Stream", "brand": "redis" },
+    { "id": "kafka", "type": "messagebus", "label": "Kafka", "sublabel": "message_persist", "brand": "kafka" },
+    { "id": "consumer", "type": "backend", "label": "持久化消费者", "sublabel": "幂等落库" },
     { "id": "mysql", "type": "database", "label": "MySQL", "sublabel": "群消息表", "brand": "mysql" },
     { "id": "online-member", "type": "external", "label": "在线成员", "sublabel": "实时接收" },
     { "id": "offline-member", "type": "external", "label": "离线成员", "sublabel": "上线补齐" }
   ],
   "segments": [
-    { "from": 150, "to": 296, "label": "发送与校验" },
-    { "from": 304, "to": 540, "label": "成员扇出" },
-    { "from": 548, "to": 680, "label": "落库与确认" },
-    { "from": 688, "to": 890, "label": "离线拉取" }
+    { "from": 150, "to": 236, "label": "发送与原子写入" },
+    { "from": 244, "to": 330, "label": "中继与确认" },
+    { "from": 338, "to": 418, "label": "异步落库" },
+    { "from": 426, "to": 502, "label": "离线拉取" }
   ],
   "messages": [
     { "id": "send-frame", "from": "sender", "to": "gateway", "y": 160, "label": "send_message 帧", "variant": "emphasis", "note": "群会话消息，连接已鉴权" },
-    { "id": "lua-check", "from": "gateway", "to": "redis", "y": 194, "label": "Lua：成员校验 + 去重 + 序号分配", "variant": "emphasis" },
-    { "id": "lua-write", "from": "gateway", "to": "redis", "y": 228, "label": "写 group_outbox 发件箱", "variant": "emphasis" },
-    { "id": "lua-ack", "from": "redis", "to": "gateway", "y": 272, "label": "原子写入成功", "variant": "return" },
-    { "id": "publish-fanout", "from": "gateway", "to": "kafka", "y": 312, "label": "发布 group_msg_fanout 事件", "variant": "emphasis" },
-    { "id": "consume-event", "from": "kafka", "to": "consumer", "y": 350, "label": "消费事件", "variant": "default" },
-    { "id": "consumer-write-outbox", "from": "consumer", "to": "redis", "y": 388, "label": "写群组发件箱", "variant": "emphasis" },
-    { "id": "read-members", "from": "consumer", "to": "redis", "y": 426, "label": "读取 group_members 成员集", "variant": "default" },
-    { "id": "members", "from": "redis", "to": "consumer", "y": 476, "label": "成员列表", "variant": "return" },
-    { "id": "update-conv", "from": "consumer", "to": "redis", "y": 514, "label": "逐成员更新会话列表与未读", "variant": "emphasis" },
-    { "id": "push-online", "from": "consumer", "to": "online-member", "y": 552, "label": "推送给在线成员", "variant": "default" },
-    { "id": "insert-mysql", "from": "consumer", "to": "mysql", "y": 592, "label": "插入群消息记录", "variant": "emphasis" },
-    { "id": "mysql-ok", "from": "mysql", "to": "consumer", "y": 642, "label": "落库确认", "variant": "return" },
-    { "id": "trim-outbox", "from": "consumer", "to": "redis", "y": 700, "label": "裁剪发件箱 ZSet", "variant": "dashed" },
-    { "id": "server-ack", "from": "consumer", "to": "sender", "y": 728, "label": "服务端 Ack + 群序号", "variant": "return", "note": "落库与发件箱写入完成后才回 Ack" },
-    { "id": "sync-req", "from": "offline-member", "to": "gateway", "y": 764, "label": "syncReq 拉取请求", "variant": "emphasis" },
-    { "id": "read-outbox", "from": "gateway", "to": "redis", "y": 800, "label": "读取共享发件箱", "variant": "default" },
-    { "id": "sync-result", "from": "gateway", "to": "offline-member", "y": 836, "label": "离线消息补齐", "variant": "return" }
+    { "id": "lua-write", "from": "gateway", "to": "redis", "y": 190, "label": "Lua：成员校验+去重+群序号+发件箱+会话", "variant": "emphasis", "note": "共享发件箱只写一份并裁剪至 2000 条；XADD 入 Stream" },
+    { "id": "lua-ack", "from": "redis", "to": "gateway", "y": 220, "label": "msg_id + groupSeq + event_id", "variant": "return" },
+    { "id": "relay-publish", "from": "gateway", "to": "kafka", "y": 250, "label": "发布 message_persist", "variant": "emphasis", "note": "relay 读取 Stream 中继到 Kafka，确认后 XACK/XDEL" },
+    { "id": "server-ack", "from": "gateway", "to": "sender", "y": 280, "label": "serverAck + 群序号", "variant": "return", "note": "Kafka 确认后回 Ack，此时消息已可撤回/删除" },
+    { "id": "push-online", "from": "gateway", "to": "online-member", "y": 310, "label": "推送在线成员", "variant": "default", "note": "按 recipients 列表逐一推送，跳过发送者" },
+    { "id": "consume", "from": "kafka", "to": "consumer", "y": 340, "label": "消费事件", "variant": "default" },
+    { "id": "insert-mysql", "from": "consumer", "to": "mysql", "y": 370, "label": "幂等插入群消息表", "variant": "emphasis" },
+    { "id": "mysql-ok", "from": "mysql", "to": "consumer", "y": 400, "label": "落库确认", "variant": "return" },
+    { "id": "sync-req", "from": "offline-member", "to": "gateway", "y": 430, "label": "syncReq 拉取请求", "variant": "emphasis" },
+    { "id": "read-outbox", "from": "gateway", "to": "redis", "y": 460, "label": "读取共享发件箱", "variant": "default", "note": "与私聊收件箱合并排序，游标分页" },
+    { "id": "sync-result", "from": "gateway", "to": "offline-member", "y": 490, "label": "离线消息补齐", "variant": "return" }
   ],
   "activations": [
     { "participant": "gateway", "from": 168, "to": 318, "type": "backend" },
-    { "participant": "redis", "from": 188, "to": 280, "type": "database" },
-    { "participant": "kafka", "from": 308, "to": 358, "type": "messagebus" },
-    { "participant": "consumer", "from": 346, "to": 690, "type": "backend" },
-    { "participant": "mysql", "from": 588, "to": 648, "type": "database" },
-    { "participant": "gateway", "from": 758, "to": 866, "type": "backend" }
+    { "participant": "redis", "from": 184, "to": 226, "type": "database" },
+    { "participant": "kafka", "from": 276, "to": 346, "type": "messagebus" },
+    { "participant": "consumer", "from": 336, "to": 406, "type": "backend" },
+    { "participant": "mysql", "from": 364, "to": 404, "type": "database" },
+    { "participant": "gateway", "from": 424, "to": 492, "type": "backend" },
+    { "participant": "redis", "from": 454, "to": 466, "type": "database" }
   ],
   "cards": [
     {
@@ -92,16 +88,16 @@
       "dot": "amber",
       "title": "原子与顺序",
       "items": [
-        "成员校验、去重、群序号分配在 Redis Lua 中一次原子完成",
-        "ACK 晚于发件箱写入，保证客户端撤回时消息必已存在"
+        "成员校验、去重、群序号、发件箱、会话列表在单次 Lua 中原子完成",
+        "群未读采用水位线模型：最新群序号减成员已读游标，读取端计算"
       ]
     },
     {
       "dot": "emerald",
-      "title": "扇出与补齐",
+      "title": "确认与补齐",
       "items": [
-        "消费者按成员逐个更新会话列表、未读并推送在线成员",
-        "离线成员上线后经 syncReq 从发件箱补齐消息"
+        "ACK 晚于 Kafka 确认，客户端收到 ACK 时消息必已存在",
+        "离线成员上线后经 syncReq 从发件箱补齐，游标分页防深翻页"
       ]
     }
   ]

@@ -38,6 +38,7 @@ type PrivateMsgConsumer struct {
 	redisRepo repository.RedisRepo
 	cm        *conn.ConnectionManager
 	logger    *zap.Logger
+	dlq       DeadLetterPolicy
 }
 
 // NewPrivateMsgConsumer 创建一个新的 PrivateMsgConsumer。
@@ -51,14 +52,20 @@ func NewPrivateMsgConsumer(reader *kafka.Reader, mysqlRepo repository.MySQLRepo,
 	}
 }
 
+// WithDeadLetter 设置重试上限与死信 Topic；不调用则失败消息一直原地重试。
+func (c *PrivateMsgConsumer) WithDeadLetter(p DeadLetterPolicy) *PrivateMsgConsumer {
+	c.dlq = p
+	return c
+}
+
 // Start 在后台 goroutine 中开始从 private_msg_persist Topic 消费。
-// 处理成功才提交 offset；临时失败在分区内退避重试；格式错误的消息直接跳过。
+// 处理成功才提交 offset；临时失败在分区内退避重试，达到上限转投 DLQ；格式错误的消息直接跳过。
 func (c *PrivateMsgConsumer) Start(ctx context.Context) error {
 	if err := requireReader(c.reader, "private msg consumer"); err != nil {
 		return err
 	}
 	c.logger.Info("私聊消息消费者已启动")
-	go runReader(ctx, c.reader, c.logger, "private-msg", c.handleMessage)
+	go runReader(ctx, c.reader, c.logger, "private-msg", c.handleMessage, c.dlq)
 	return nil
 }
 
