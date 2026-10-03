@@ -1,0 +1,10 @@
+# Working directory: labs. Set the secret before starting the process.
+server:
+  port: 18101
+  read_header_timeout_ms: 3000
+  request_body_limit_bytes: 4096
+jwt:
+  secret: "${NANOIM_JWT_SECRET}"
+  access_exp_minutes: 10
+cors:
+  allowed_origins: ["http://localhost:18102"]

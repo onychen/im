@@ -1,0 +1,306 @@
+{
+  "backend/internal/model/message.go": {
+    "sha256": "695f01df2bc0ea46333c37819244a35a8d5f7de5e92e6ca1873bc3a3ea516f24",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/protocol/protocol.go": {
+    "sha256": "78b65ba249073527e688d9ed67cb2deb07717ccad8069d59817b3f3cf0e83104",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/relay/message_relay.go": {
+    "sha256": "39e79a27447d8c66ced5880cd0ba1e081e0b9232d762ca5e08603ed7609b07e6",
+    "kind": "项目源码快照"
+  },
+  "labs/01-http/main.go": {
+    "sha256": "2e52c30c4a28a0f95b1236b0b4d1884f6d6ff41833deef508a3411ec89345f3d",
+    "kind": "教学实验"
+  },
+  "labs/go.mod": {
+    "sha256": "1566e0700530c568fbdd16e294530acf492c20e7b44b831914d4ced1f251630a",
+    "kind": "教学实验"
+  },
+  "backend/go.mod": {
+    "sha256": "b6f6c11b0ebd227631abce6cc0560134f50143eff84c760a3adb5157482c48f6",
+    "kind": "项目源码快照"
+  },
+  "backend/cmd/server/main.go": {
+    "sha256": "0bdd4bab2c6eba00a0d6648887c7fa924672b69debc9bd12ad9fb00c07fdc680",
+    "kind": "项目源码快照"
+  },
+  "labs/02-gin/main.go": {
+    "sha256": "4a12246294556a794225cc14fa9481051285594e0236946ecf1f7ddf1242bdaf",
+    "kind": "教学实验"
+  },
+  "backend/internal/api/response.go": {
+    "sha256": "bd40cfd3ee518e5321bb8a37ed1f123fa5ed099b359178b37f877c66e5fd1fa0",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/api/auth_handler.go": {
+    "sha256": "79c063ef0db6a68f10ac232f88c3d3e88afc65575bcfd72dcb127d7719628ed2",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/auth_service.go": {
+    "sha256": "f1a08d90ca592fb52bbc9bd441c9292bf7ff9740b8ec4f080f0729ffdcf40223",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/repository/mysql_repo.go": {
+    "sha256": "2bbbb0c3ebbdf9298910644b184eff3c3b82c2828b6c9f637c43e1e75e467fae",
+    "kind": "项目源码快照"
+  },
+  "backend/scripts/migrations/001_create_users.sql": {
+    "sha256": "02d38cbc019d930ed8570812a921d1256c0b33399ef428b90c2f1afe6e4120fa",
+    "kind": "项目源码快照"
+  },
+  "backend/scripts/migrations/002_create_friendships.sql": {
+    "sha256": "5704cfbcb071b5e5968025d0a90638f8a3c759377c2bb7af73578f06c60df600",
+    "kind": "项目源码快照"
+  },
+  "backend/scripts/migrations/004_create_messages.sql": {
+    "sha256": "59ba0c010ff8ffeefdcda1ea15efd8d04b0ad41c6df67082890dddaf3abdd662",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/infra/mysql.go": {
+    "sha256": "569602c35780049ab3121452cc25374dd042b37f557d26489c97eb19ee5d08ba",
+    "kind": "项目源码快照"
+  },
+  "labs/03-auth/main.go": {
+    "sha256": "1278551c842addc81e812f2fa665444358d2e7353dd96d32c7172d1df15ea1fd",
+    "kind": "教学实验"
+  },
+  "backend/internal/middleware/auth_middleware.go": {
+    "sha256": "49f2c288666d37e7ab7d03e63144d517fd128b6f965a26702f97c60560e8dda3",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/middleware/auth_middleware_test.go": {
+    "sha256": "87e1903521c7c58ed1cae3067a3b531657012bd52b9827f7a2a4767bc1e9f04f",
+    "kind": "项目源码快照"
+  },
+  "backend/configs/config.local.example.yaml": {
+    "sha256": "8d435b96addcdefcc794da18ad5464978d4d21efa079b71181c0bf71d2dc6f92",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/config/config.go": {
+    "sha256": "33c1f7c84ad6c71ea0adf6f904d3dc040695469ac0c61f19823560e77695774a",
+    "kind": "项目源码快照"
+  },
+  "docker-compose.yaml": {
+    "sha256": "32f5b21b67797656675069d79cd22f2d0f0a16d3550c956cb96fe2eb4242d879",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/infra/redis.go": {
+    "sha256": "10da4fe454315f27857a4620e35594dd4996b4a8f429211c9c09b36951e019eb",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/infra/kafka.go": {
+    "sha256": "12e40d8e9b941ac41ab97210d4907cd81b17061dde475105f946af6e2ad91f2e",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/middleware/cors_middleware.go": {
+    "sha256": "cb8b2e7cef880c7428cb3591a493065f4e70908c5362373da43445b4c8336f1c",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/ws/upgrade.go": {
+    "sha256": "cad318531ce29d2c8af90c6899e925c42b752cdf814ed698559a9685c88a1601",
+    "kind": "项目源码快照"
+  },
+  "frontend/src/config/env.ts": {
+    "sha256": "b185b54d2c07f20b1891d4158ef575d46002a4b4d7d58439992b6ad663dadaf4",
+    "kind": "项目源码快照"
+  },
+  "labs/05-api/main.go": {
+    "sha256": "95953c32c5e9e7bb879a5c8bd62a72fc9270450e18553aa3b630b1e23ae88f5e",
+    "kind": "教学实验"
+  },
+  "labs/05-api/config.example.yaml": {
+    "sha256": "7c566ca55d5266826469cd7dc9bdf5633ce1fcec0079ac676e429c2432083f98",
+    "kind": "教学实验"
+  },
+  "labs/05-api/client.html": {
+    "sha256": "752c005d31289d999e4b5a42dcead9febdea4b0250af07f1d80c6a18e69f59c7",
+    "kind": "教学实验"
+  },
+  "backend/internal/api/settings_handler.go": {
+    "sha256": "d9b449b428d97cb53ea8b9f6fbfb5d4bdd3bf9249ac5b7cda4998963426ba306",
+    "kind": "项目源码快照"
+  },
+  "frontend/src/api/client.ts": {
+    "sha256": "a993cd425c4f8d3a6cd4bb9298548a9a1e2da149dc9dd69fc3c16f814e90d4ec",
+    "kind": "项目源码快照"
+  },
+  "frontend/src/lib/api.ts": {
+    "sha256": "f51896e128a0c9ae86e7c814678a901d8a482a4ff6a0f1b8203fe70b01fddf4d",
+    "kind": "项目源码快照"
+  },
+  "frontend/src/api/settings.ts": {
+    "sha256": "beef37f99f0ccf6f7f11bdfc0dfd5d919ed9951e83048b2ac6078a818b5a4210",
+    "kind": "项目源码快照"
+  },
+  "frontend/vite.config.ts": {
+    "sha256": "3d29c229681e57aaea8dbc035366e1b00be754ea62e3051f827ce965ea29aa64",
+    "kind": "项目源码快照"
+  },
+  "frontend/goim-api-types.ts": {
+    "sha256": "316d5379b5b8a608a03043f30f0b26c5fa9448ee7ff4c4096a0bf5ebed6d88c4",
+    "kind": "项目源码快照"
+  },
+  "frontend/src/realtime/socket.ts": {
+    "sha256": "f9231ca55bb611dcf8141620ab4200f97546939ceb768ab3eddd79ac5a010fab",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/friend_service.go": {
+    "sha256": "651032cbdfec88bff80af455d0ecef4c6b841c700c93c21be18e6e511ecce6f6",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/group_service.go": {
+    "sha256": "73da7a80d069240bcdb66007cffb8a1e987680d8d289382b87252d2aede37afb",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/api/friend_handler.go": {
+    "sha256": "41cda53c51f846bfcf677169de2f2ef2f79f8e9271d394da5c48a522077ad7a9",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/api/group_handler.go": {
+    "sha256": "6bac212ea4818b5f2f1e5d407be069e49ab823fb6f7b7c63a57e155f6dcf9af1",
+    "kind": "项目源码快照"
+  },
+  "backend/scripts/migrations/003_create_groups.sql": {
+    "sha256": "1bfa72010eab3c34d83c8cf64dc46d4d66862d39412cdb772eed6c4ca803ed3f",
+    "kind": "项目源码快照"
+  },
+  "labs/04-ws/main.go": {
+    "sha256": "112622883824bc372daf94136c32664256e3c18ebdb32eacec066d2ddea4209f",
+    "kind": "教学实验"
+  },
+  "backend/internal/ws/handler.go": {
+    "sha256": "f94bfc2eaf554419571f7285b0c6069cc4382c25b20e75b307ebdb8f66019f42",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/conn/client.go": {
+    "sha256": "b10dfc31b85fd2d699e99d7b23ab7491e88c7b9dfffb5b1295d8e5a9b0963274",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/conn/manager.go": {
+    "sha256": "94115e71ff389fffa422fb1868af32aab5579a5d18695967ab47526173b93856",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/repository/redis_repo.go": {
+    "sha256": "ebda669b5c99313d059d00e27bb3d0cebd0bac00a0909647c31f7ee6fda5838c",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/repository/message_pipeline.go": {
+    "sha256": "91f80f3e179e4326e2e5b2942e57befc5bda70c865c92aa66c67cbad3e282b9e",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/redis/lua_private_msg.go": {
+    "sha256": "7a2729d7fd762fad88e57ebefe16f523b5d3c595798bd9aa515372e415e4610c",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/redis/lua_message_write.go": {
+    "sha256": "800c75c5e50d95798a06807c28b4bb3926216132bafba779735832c40f36ebba",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/infra/cleanup.go": {
+    "sha256": "6f26548e9615f788b4de20550c32810e74a12df992ef7177b4bcd81abea3cf9a",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/redis/lua_message_write_test.go": {
+    "sha256": "54a9378748cecfd994dab4e654d72c2dc87426f61b29791aaba87a4f22c0f205",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/msg_service.go": {
+    "sha256": "9ba0f12f300fa9a6f4bbe2dab1a9bb92f213990368cb3f3f1697d44a346ece2a",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/repository/mq_repo.go": {
+    "sha256": "0620d51ed37799c1db5112ec887cf0176fb9c7f55f0b106ef3f34a9bd3a2b518",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/consumer/kafka_runner.go": {
+    "sha256": "0aaf770839e807f6c330c649af791e3f7ddf3fe8e83a525503b234a664c06b71",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/consumer/message_persist_consumer.go": {
+    "sha256": "44c5dd79ddf0933c42a92b92aa07f59e620c3b6bf16243b30dd8abafda2295fa",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/redis/lua_inbox_mark_read.go": {
+    "sha256": "46cecda7451df7c44c1a634955aba9658ca217c04ea7adc1bbe8f6906dfe933a",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/repository/redis_repo_integration_test.go": {
+    "sha256": "27cb521f3f6cdf1161c8e3cfba0937293cc3abd14be65b00df8eb052eb4a541e",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/moment_service.go": {
+    "sha256": "5689ef9adb017056f3031e39547a25e1e8d81dfef594e8f0495cbaf0c6fa2e7c",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/consumer/moment_feed_consumer.go": {
+    "sha256": "3ee0967572130e2bd4ac3005f1537bc98976f92eca84eedac5e279f03652a9f8",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/consumer/like_persist_consumer.go": {
+    "sha256": "22d5522b09e64386846d4278e10790caa6512d0252e2afa61d2d7d0ea20493f2",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/redis/lua_moment_like.go": {
+    "sha256": "12d18841e3f5eb1e1083c2e876cb2ea7231b3c5b84114161ab43e2db2294213a",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/api/upload_handler.go": {
+    "sha256": "028b630e9434540b45030c2ae0973dcedf28e478a1ba76b2a0d1db0b26c8b0f9",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/msg_op_service.go": {
+    "sha256": "8e5a43fa2b3e0e8b0ed0a75a0439292ac2158a191c83d41804aaa3ac328010c7",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/redis/lua_revoke_msg.go": {
+    "sha256": "f1f23d64a609390ced722f7dc7cf729dc150969fa61718ca8715cf7d2d9fd7e3",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/settings_service.go": {
+    "sha256": "faecc12c1df63a516a2c09e41f50bf0b41ac46918359727d6e23db3322cbf387",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/model/settings.go": {
+    "sha256": "8f1944ecb531b1a3facbfe2d1ec6ca24f73c9921cfa5c49124e80d82e3968fea",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/service/msg_service_test.go": {
+    "sha256": "b6b482b64d74fc0a019ff104373feab1cd6e2dd5493e60ee86eca9cc9d572632",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/relay/message_relay_test.go": {
+    "sha256": "d8c65b9027a33f61e4db94279abce9a415e1ba337e015081ffad339e0758f22b",
+    "kind": "项目源码快照"
+  },
+  "backend/internal/repository/mysql_message_integration_test.go": {
+    "sha256": "d5d8f86571e228ac39523c24033fb8427502bcc16a11c764ef4c2e6ffdb68179",
+    "kind": "项目源码快照"
+  },
+  "backend/tests/e2e_test.go": {
+    "sha256": "0f7de973354219b19f1972fd92b88588e06d86757f4923ade6b82312bc967b0a",
+    "kind": "项目源码快照"
+  },
+  "backend/configs/config.test.yaml": {
+    "sha256": "6704936f1ed5d59ff07c85413590b8e0dd28e744424f18a01d70d90106015a19",
+    "kind": "项目源码快照"
+  },
+  "backend/benchmark/README.md": {
+    "sha256": "e91b7b63496eb5057076fefbe55857d14859195c5f117114b30dbaee5de24ea8",
+    "kind": "项目源码快照"
+  },
+  "backend/benchmark/msg_bench.go": {
+    "sha256": "df0459a105ae9bfea7a2896dc5c3be400750ef7a81f4f67094974dba0522aecc",
+    "kind": "项目源码快照"
+  },
+  "deploy/docker-compose.prod.yaml": {
+    "sha256": "d65307a6f89bd3fc9eeef91ea7842c6446296e7a64421d62519a6cbb46c301d9",
+    "kind": "项目源码快照"
+  },
+  "Dockerfile": {
+    "sha256": "3739bc600b25be01cc20b8aea181ad8e0edecdf770e81b4aa1e489af06a00573",
+    "kind": "项目源码快照"
+  }
+}

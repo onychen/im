@@ -4,7 +4,7 @@
 
 一个面向 Web 的即时通讯应用，支持私聊、群聊、好友关系、朋友圈动态、文件上传与实时 WebSocket 通信。
 
-[在线访问](https://im.vectorcontrol.tech/) · [快速开始](#快速开始) · [开发文档](#重要文档)
+[在线访问](https://im.vectorcontrol.tech/) · [后端教程](https://onychen.github.io/im/) · [快速开始](#快速开始) · [开发文档](#重要文档)
 
 ![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go&logoColor=00ADD8)
 ![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=61DAFB)
