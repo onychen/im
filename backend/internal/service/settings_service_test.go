@@ -78,13 +78,6 @@ func (m *mockSettingsRepo) CreateOrUpdateUserSettings(_ context.Context, setting
 
 // ── Stub out all other MySQLRepo methods ──
 
-func (m *mockSettingsRepo) InsertPrivateMessage(_ context.Context, _ *model.PrivateMessage) error {
-	return nil
-}
-func (m *mockSettingsRepo) InsertGroupMessage(_ context.Context, _ *model.GroupMessage) error {
-	return nil
-}
-func (m *mockSettingsRepo) InsertMsgRevoked(_ context.Context, _ *model.MsgRevoked) error { return nil }
 func (m *mockSettingsRepo) GetUserByID(_ context.Context, _ int64) (*model.User, error) {
 	return nil, nil
 }
@@ -161,9 +154,6 @@ func (m *mockSettingsRepo) GetMomentsByIDs(_ context.Context, _ []int64) ([]mode
 	return nil, nil
 }
 
-func (m *mockSettingsRepo) SearchPrivateMessages(_ context.Context, _ int64, _ string, _ int, _ int) ([]model.PrivateMessage, error) {
-	return nil, nil
-}
 
 // ──────────────────────────────────────────────────────
 // Helper: new test SettingsService

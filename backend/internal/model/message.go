@@ -1,110 +1,62 @@
 package model
 
-import "time"
+// ──────────────────────────────────────────────────────
+// 存储模型
+// ──────────────────────────────────────────────────────
 
-type PrivateMessage struct {
-	ID          int64     `json:"msgId"`
-	ClientMsgID string    `json:"clientMsgId,omitempty"`
-	SenderID    int64     `json:"fromId"`
-	ReceiverID  int64     `json:"toId"`
-	Content     string    `json:"content"`
-	MsgType     int       `json:"msgType"`
-	CreatedAt   time.Time `json:"timestamp"`
-}
+// 消息状态
+const (
+	MsgStatusNormal  = 0
+	MsgStatusRevoked = 1
+)
 
-type GroupMessage struct {
-	ID          int64     `json:"msgId"`
-	ClientMsgID string    `json:"clientMsgId,omitempty"`
-	GroupID     int64     `json:"groupId"`
-	SenderID    int64     `json:"fromId"`
-	Content     string    `json:"content"`
-	MsgType     int       `json:"msgType"`
-	GroupSeq    int64     `json:"groupSeq"`
-	CreatedAt   time.Time `json:"timestamp"`
-}
-
-type MsgRevoked struct {
-	ID         int64     `json:"id"`
-	MsgID      int64     `json:"msg_id"`
-	ConvID     string    `json:"conv_id"`
-	OperatorID int64     `json:"operator_id"`
-	RevokedAt  time.Time `json:"revoked_at"`
-}
-
-// InboxMessage — 存储在 Redis inbox/outbox ZSet 中的消息
-type InboxMessage struct {
-	MsgID       int64  `json:"msgId"`
-	ClientMsgID string `json:"clientMsgId,omitempty"`
+// Message 是私聊、群聊统一的消息模型，对应 messages 表，也是 msg_topic 中的事件体。
+// (ConvID, Seq) 唯一确定一条消息；Seq 在会话内单调递增，允许因发送失败留下空洞。
+type Message struct {
 	ConvID      string `json:"convId"`
+	Seq         int64  `json:"seq"`
+	MsgID       int64  `json:"msgId,string"` // 雪花 ID，全局唯一；超过 JS 安全整数，JSON 中以字符串传输
 	ConvType    int    `json:"convType"`
-	FromID      int64  `json:"fromId"`
-	ToID        int64  `json:"toId"`
+	SenderID    int64  `json:"fromId"`
 	MsgType     int    `json:"msgType"`
 	Content     string `json:"content"`
-	ReadStatus  int    `json:"readStatus"`         // 0=未读, 1=已读 (仅私聊)
-	GroupSeq    int64  `json:"groupSeq,omitempty"` // 群消息序号 (仅群聊)
-	Timestamp   int64  `json:"timestamp"`
+	Status      int    `json:"status"` // 0=正常, 1=已撤回
+	ClientMsgID string `json:"clientMsgId,omitempty"`
+	Timestamp   int64  `json:"timestamp"` // 服务端时间，毫秒
 }
 
-// MessagePersistEvent is the durable event written by the atomic Redis send
-// script and relayed to Kafka.  Redis owns the routing/state changes; the
-// consumer only persists this immutable event to MySQL.
-type MessagePersistEvent struct {
-	EventID         string  `json:"eventId,omitempty"`
-	ServerMsgID     int64   `json:"serverMsgId"`
-	ClientMsgID     string  `json:"clientMsgId"`
-	ConvType        int     `json:"convType"`
-	SenderID        int64   `json:"senderId"`
-	ReceiverID      int64   `json:"receiverId,omitempty"`
-	GroupID         int64   `json:"groupId,omitempty"`
-	Content         string  `json:"content"`
-	MsgType         int     `json:"msgType"`
-	ServerTimestamp int64   `json:"serverTimestamp"`
-	GroupSeq        int64   `json:"groupSeq,omitempty"`
-	Recipients      []int64 `json:"recipients,omitempty"`
+// Conversation 对应 conversations 表：会话级元数据，由 persist 消费者维护。
+type Conversation struct {
+	ConvID       string `json:"convId"`
+	ConvType     int    `json:"convType"`
+	MaxSeq       int64  `json:"maxSeq"`
+	LastMsgID    int64  `json:"lastMsgId,string"`
+	LastMsgBrief string `json:"lastMsgBrief"`
+	LastSenderID int64  `json:"lastSenderId"`
+	LastMsgAt    int64  `json:"lastMsgAt"` // 毫秒
 }
 
-// ServerAck — 消息到达服务器后返回给发送者的回执
-type ServerAck struct {
-	ClientMsgID string `json:"clientMsgId"`
-	ServerMsgID int64  `json:"serverMsgId"`
-	GroupSeq    int64  `json:"groupSeq,omitempty"`
-	Timestamp   int64  `json:"timestamp"`
+// UserConversation 对应 user_conversations 表：用户在某个会话上的个人状态。
+type UserConversation struct {
+	UserID  int64  `json:"userId"`
+	ConvID  string `json:"convId"`
+	ReadSeq int64  `json:"readSeq"`
+	MinSeq  int64  `json:"minSeq"` // 小于该值的消息对该用户不可见（清空聊天记录）
+	Pinned  bool   `json:"pinned"`
+	Muted   bool   `json:"muted"`
+	Hidden  bool   `json:"hidden"`
 }
 
-// DeliverAck — 接收者确认消息已送达
-type DeliverAck struct {
-	ServerMsgID int64 `json:"serverMsgId"`
+// RevokeNotice 是撤回通知消息（MsgTypeRevoked）的 content。
+type RevokeNotice struct {
+	TargetSeq   int64 `json:"targetSeq"`
+	TargetMsgID int64 `json:"targetMsgId,string"`
+	OperatorID  int64 `json:"operatorId"`
 }
 
-// ReadAck — 用户将会话标记为已读
-type ReadAck struct {
-	ConvID string `json:"convId"`
-	// LastReadGroupSeq 群聊已读水位线：客户端已展示的最后一条群消息序号。
-	// 缺省(0)时服务端降级为"标记到当前最新"（等价旧的整会话清零）；私聊忽略此字段。
-	LastReadGroupSeq int64 `json:"lastReadGroupSeq,omitempty"`
-}
-
-// SyncReq — 客户端请求离线消息同步
-type SyncReq struct {
-	LastSyncTime  int64 `json:"lastSyncTime"`
-	LastSyncMsgID int64 `json:"lastSyncMsgId,omitempty"`
-	BatchSize     int   `json:"batchSize"`
-}
-
-// SyncBatch — 服务端分批返回离线消息
-type SyncBatch struct {
-	Messages  []InboxMessage `json:"msgs"`
-	HasMore   bool           `json:"hasMore"`
-	SyncTime  int64          `json:"syncTime,omitempty"`
-	SyncMsgID int64          `json:"syncMsgId,omitempty"`
-}
-
-// ConvSync — 同步时推送的会话列表及未读数
-type ConvSync struct {
-	Conversations []ConvSummary    `json:"conversations"`
-	UnreadMap     map[string]int64 `json:"unreadMap"`
-}
+// ──────────────────────────────────────────────────────
+// WebSocket 协议负载
+// ──────────────────────────────────────────────────────
 
 // SendMessage — 客户端通过 WebSocket 发送的聊天消息
 type SendMessage struct {
@@ -113,29 +65,67 @@ type SendMessage struct {
 	ToID        int64  `json:"toId"`     // 接收者ID(私聊) 或 群组ID(群聊)
 	MsgType     int    `json:"msgType"`  // 1=文字, 2=图片, 3=视频, 等
 	Content     string `json:"content"`
+}
+
+// ServerAck — 消息写入 Kafka 成功后返回给发送者的回执
+type ServerAck struct {
+	ClientMsgID string `json:"clientMsgId"`
+	ServerMsgID int64  `json:"serverMsgId,string"`
+	ConvID      string `json:"convId"`
+	Seq         int64  `json:"seq"`
 	Timestamp   int64  `json:"timestamp"`
+}
+
+// ReadAck — 用户把会话已读到 seq（只允许前进）
+type ReadAck struct {
+	ConvID string `json:"convId"`
+	Seq    int64  `json:"seq"`
+}
+
+// ConvView — convSync 中返回的单个会话视图
+type ConvView struct {
+	ConvID       string   `json:"convId"`
+	ConvType     int      `json:"convType"`
+	TargetID     int64    `json:"targetId"`
+	TargetName   string   `json:"targetName"`
+	TargetAvatar string   `json:"targetAvatar"`
+	MaxSeq       int64    `json:"maxSeq"`
+	ReadSeq      int64    `json:"readSeq"`
+	MinSeq       int64    `json:"minSeq"`
+	Unread       int64    `json:"unread"`
+	LastMsg      *Message `json:"lastMsg,omitempty"`
+	LastMsgBrief string   `json:"lastMsgBrief"`
+	LastMsgTime  int64    `json:"lastMsgTime"`
+	Pinned       bool     `json:"pinned"`
+	Muted        bool     `json:"muted"`
+}
+
+// ConvSync — 对 convSyncReq 的响应：用户全部会话的最新状态
+type ConvSync struct {
+	Conversations []ConvView `json:"conversations"`
+}
+
+// PullMsgsReq — 按 seq 区间补拉消息，区间为闭区间 [FromSeq, ToSeq]
+type PullMsgsReq struct {
+	ConvID  string `json:"convId"`
+	FromSeq int64  `json:"fromSeq"`
+	ToSeq   int64  `json:"toSeq"`
+}
+
+// PullMsgsResp — pullMsgs 的响应；HasMore 表示区间被截断，客户端应从 ToSeq+1 继续拉。
+// Watermark 是会话的已投递水位：seq <= Watermark 的消息都已被消费者处理，区间内缺失的 seq 是空洞，不会再出现。
+// ToSeq 不会超过 Watermark，客户端可以安全地把本地同步位置推进到 ToSeq。
+type PullMsgsResp struct {
+	ConvID    string    `json:"convId"`
+	FromSeq   int64     `json:"fromSeq"`
+	ToSeq     int64     `json:"toSeq"`
+	Watermark int64     `json:"watermark"`
+	Msgs      []Message `json:"msgs"`
+	HasMore   bool      `json:"hasMore"`
 }
 
 // RevokeMsgReq — 客户端请求撤回一条消息
 type RevokeMsgReq struct {
-	ConvID      string `json:"convId"`
-	ServerMsgID int64  `json:"serverMsgId"`
-}
-
-// RevokedNotification — 消息被撤回后推送给对方的通知
-type RevokedNotification struct {
-	ConvID      string `json:"convId"`
-	ServerMsgID int64  `json:"serverMsgId"`
-	OperatorID  int64  `json:"operatorId"`
-}
-
-// ConvSummary — conv_list ZSet 中的单条会话摘要
-type ConvSummary struct {
-	ConvID       string `json:"convId"`
-	ConvType     int    `json:"convType"`
-	TargetID     int64  `json:"targetId"`
-	TargetName   string `json:"targetName"`
-	TargetAvatar string `json:"targetAvatar"`
-	LastMsg      string `json:"lastMsg"`
-	LastMsgTime  int64  `json:"lastMsgTime"`
+	ConvID string `json:"convId"`
+	Seq    int64  `json:"seq"`
 }

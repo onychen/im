@@ -94,10 +94,14 @@ func splitAndTrim(raw string) []string {
 	return out
 }
 
+// MessageConfig 控制消息链路的参数。
 type MessageConfig struct {
-	// AtomicPipeline enables Redis Lua + Stream relay.  Set false during a
-	// rollback to use the legacy Kafka consumers temporarily.
-	AtomicPipeline bool `yaml:"atomic_pipeline"`
+	// NodeID 是雪花算法的机器号（0-1023），单机部署保持默认 0 即可。
+	NodeID int64 `yaml:"node_id"`
+	// PersistBatchSize 是消息落库消费者的攒批阈值。默认 200。
+	PersistBatchSize int `yaml:"persist_batch_size"`
+	// PersistFlushMs 是消息落库消费者的最大攒批间隔（毫秒）。默认 100。
+	PersistFlushMs int `yaml:"persist_flush_ms"`
 }
 
 type JWTConfig struct {
@@ -140,10 +144,12 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
-	// The new pipeline is the default for deployments that do not yet have a
-	// message section in their config file.
-	if !strings.Contains(string(data), "atomic_pipeline:") {
-		cfg.Message.AtomicPipeline = true
+	// 消息链路默认值
+	if cfg.Message.PersistBatchSize <= 0 {
+		cfg.Message.PersistBatchSize = 200
+	}
+	if cfg.Message.PersistFlushMs <= 0 {
+		cfg.Message.PersistFlushMs = 100
 	}
 
 	// Kafka 默认值（未配置时生效）

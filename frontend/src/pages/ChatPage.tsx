@@ -3,14 +3,18 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, ArrowUp, BellOff, CheckCheck, CircleAlert, LoaderCircle, MessageCircle, MoreHorizontal, Plus, RotateCcw, Search, WifiOff } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { NavLink, useNavigate, useParams } from "react-router-dom";
-import { Avatar, Badge, Drawer, EmptyState, IconButton, Switch, TextField } from "../components/ui";
+import { Avatar, Badge, Drawer, EmptyState, IconButton, Switch, TextField, ToastViewport } from "../components/ui";
 import { goimSocket } from "../realtime/socket";
 import { useAuthStore } from "../stores/authStore";
 import { useChatStore, type ChatMessage } from "../stores/chatStore";
 import { CreateGroupDrawer, GroupManagementDrawer } from "../features/groups/GroupManagement";
-import { groupsApi, settingsApi } from "../lib/api";
+import { conversationsApi, groupsApi, settingsApi } from "../lib/api";
+import type { WsMessage } from "../../goim-ws-types";
 
 const emptyMessages: ChatMessage[] = [];
+/** 距顶部小于这个像素时触发上滑加载历史 */
+const HISTORY_TRIGGER_PX = 60;
+const HISTORY_PAGE_SIZE = 30;
 
 const connectionLabels = {
   idle: "未连接",
@@ -32,7 +36,10 @@ export function ChatPage() {
   const retryMessage = useChatStore((state) => state.retryMessage);
   const markConversationRead = useChatStore((state) => state.markConversationRead);
   const setConversationMuted = useChatStore((state) => state.setConversationMuted);
+  const toasts = useChatStore((state) => state.toasts);
+  const historyHasMore = useChatStore((state) => state.historyHasMore[conversationId ?? ""] ?? true);
   const previewMode = useAuthStore((state) => state.previewMode);
+  const currentUserId = useAuthStore((state) => state.user?.id ?? 0);
   const selected = conversations.find((item) => item.id === conversationId);
   const selectedId = selected?.id;
   const groupMembersQuery = useQuery({
@@ -49,6 +56,9 @@ export function ChatPage() {
   const reduceMotion = useReducedMotion();
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const initiallyPositionedConversationRef = useRef<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  /** 上滑加载前的滚动快照；prepend 后据此保持可视位置不跳动 */
+  const historyAnchorRef = useRef<{ convId: string; height: number; top: number } | null>(null);
 
   useEffect(() => {
     if (conversationId && mode === "live" && conversations.length > 0 && !selected) navigate(`/app/chats/${conversations[0].id}`, { replace: true });
@@ -56,19 +66,29 @@ export function ChatPage() {
 
   useEffect(() => {
     if (!selectedId) return;
-    markConversationRead(selectedId);
-    if (!previewMode && connectionState === "connected") {
-      // 群聊已读水位线：携带最后一条已展示群消息的序号，服务端据此精确定位"读到第几条"。
-      // 私聊无 groupSeq，不携带该字段（服务端按原行为清零计数）。
-      const lastGroupSeq = messages.reduce((max, message) => (message.groupSeq ? Math.max(max, message.groupSeq) : max), 0);
-      goimSocket.send({ type: "readAck", data: lastGroupSeq > 0 ? { convId: selectedId, lastReadGroupSeq: lastGroupSeq } : { convId: selectedId } });
+    if (previewMode) {
+      markConversationRead(selectedId);
+      return;
     }
+    if (connectionState !== "connected") return;
+    // 已读位置 = 当前会话已知的最大 seq；只有位置前进时才上报，服务端只进不退。
+    const readSeq = markConversationRead(selectedId);
+    if (readSeq > 0) goimSocket.send({ type: "readAck", data: { convId: selectedId, seq: readSeq } });
   }, [connectionState, markConversationRead, messages, previewMode, selectedId]);
 
   useLayoutEffect(() => {
     if (!selectedId || (mode === "live" && !syncCompleted)) return;
     const scrollContainer = messageScrollRef.current;
     if (!scrollContainer) return;
+
+    const anchor = historyAnchorRef.current;
+    if (anchor) {
+      historyAnchorRef.current = null;
+      if (anchor.convId === selectedId) {
+        scrollContainer.scrollTop = scrollContainer.scrollHeight - anchor.height + anchor.top;
+        return;
+      }
+    }
 
     const isInitialPosition = initiallyPositionedConversationRef.current !== selectedId;
     if (isInitialPosition) {
@@ -78,6 +98,34 @@ export function ChatPage() {
     }
     scrollContainer.scrollTo({ top: scrollContainer.scrollHeight, behavior: reduceMotion ? "auto" : "smooth" });
   }, [messages.length, mode, reduceMotion, selectedId, syncCompleted]);
+
+  const loadOlderMessages = async () => {
+    if (!selectedId || previewMode || historyLoading || !historyHasMore) return;
+    const oldestSeq = messages.reduce((min, item) => (item.seq && item.seq < min ? item.seq : min), Number.POSITIVE_INFINITY);
+    if (oldestSeq <= 1) {
+      useChatStore.getState().prependHistory(selectedId, [], false, currentUserId);
+      return;
+    }
+    const scrollContainer = messageScrollRef.current;
+    setHistoryLoading(true);
+    try {
+      // beforeSeq=0 表示从最新开始；本地已有消息时从最小 seq 往前翻。服务端会遵守 min_seq（清空记录/入群位置）。
+      const beforeSeq = Number.isFinite(oldestSeq) ? oldestSeq : 0;
+      const page = await conversationsApi.history(selectedId, { beforeSeq, limit: HISTORY_PAGE_SIZE });
+      if (scrollContainer && page.msgs.length > 0) historyAnchorRef.current = { convId: selectedId, height: scrollContainer.scrollHeight, top: scrollContainer.scrollTop };
+      // 一页全被"仅自己删除"过滤掉时无法再推进游标，按没有更多处理，避免反复请求同一页。
+      useChatStore.getState().prependHistory(selectedId, page.msgs as WsMessage[], page.hasMore && page.msgs.length > 0, currentUserId);
+    } catch {
+      useChatStore.getState().pushToast("加载历史消息失败，请稍后重试", "error");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleMessageScroll = () => {
+    const scrollContainer = messageScrollRef.current;
+    if (scrollContainer && scrollContainer.scrollTop < HISTORY_TRIGGER_PX) void loadOlderMessages();
+  };
 
   const sendMessage = () => {
     const content = draft.trim();
@@ -94,8 +142,13 @@ export function ChatPage() {
   };
 
   const revokeMessage = (message: ChatMessage) => {
-    if (!message.serverMsgId || !selected) return;
-    goimSocket.send({ type: "revokeMsg", data: { convId: selected.id, serverMsgId: message.serverMsgId } });
+    if (!message.seq || !selected) return;
+    if (previewMode) {
+      useChatStore.getState().revokeMessage(selected.id, message.seq);
+      return;
+    }
+    // 结果通过 serverAck（clientMsgId = revoke:{convId}:{seq}）返回，store 收到后把原消息标为已撤回。
+    goimSocket.send({ type: "revokeMsg", data: { convId: selected.id, seq: message.seq } });
   };
 
   const toggleMute = async (muted: boolean) => {
@@ -144,7 +197,9 @@ export function ChatPage() {
               </div>
             </header>
             {connectionState !== "connected" && !previewMode && <div className="chat-connection-banner"><WifiOff size={14} /><span>{connectionLabels[connectionState]}，未确认的消息会保留并允许重试。</span></div>}
-            <div className="message-scroll" ref={messageScrollRef}>
+            <div className="message-scroll" onScroll={handleMessageScroll} ref={messageScrollRef}>
+              {!previewMode && historyLoading && <div className="message-day"><span><LoaderCircle className="ui-spinner" size={11} /> 正在加载更早的消息</span></div>}
+              {!previewMode && !historyLoading && !historyHasMore && messages.length > 0 && <div className="message-day"><span>没有更早的消息了</span></div>}
               <div className="message-day"><span>今天</span></div>
               {messages.length === 0 && <div className="conversation-empty"><MessageCircle size={21} /><p>还没有消息，发一句问候吧。</p></div>}
               <AnimatePresence initial={false}>
@@ -161,7 +216,7 @@ export function ChatPage() {
                         {message.from === "me" && message.status === "sent" && <CheckCheck size={12} />}
                         {message.status === "pending" && <LoaderCircle className="ui-spinner" size={11} />}
                         {message.status === "failed" && <button aria-label="重新发送" onClick={() => retryMessage(selected.id, message.id, previewMode)} title={message.error}><CircleAlert size={11} />发送失败<RotateCcw size={10} /></button>}
-                        {message.from === "me" && message.status === "sent" && message.serverMsgId && Date.now() - message.timestamp <= 120_000 && <button className="message-revoke" onClick={() => revokeMessage(message)} type="button">撤回</button>}
+                        {message.from === "me" && message.status === "sent" && Boolean(message.seq) && Date.now() - message.timestamp <= 120_000 && <button className="message-revoke" onClick={() => revokeMessage(message)} type="button">撤回</button>}
                       </span>
                     </div>
                   </motion.div>
@@ -184,6 +239,7 @@ export function ChatPage() {
         <div className="group-notification-setting"><Switch checked={Boolean(selected?.muted)} description="开启后，该会话不会触发声音与桌面通知。" disabled={muteSaving} label="消息免打扰" onCheckedChange={(checked) => void toggleMute(checked)} />{muteError && <p className="drawer-setting-error">{muteError}</p>}</div>
       </Drawer>}
       <CreateGroupDrawer onClose={() => setCreateGroupOpen(false)} onCreated={(id) => navigate(`/app/chats/${id}`)} open={createGroupOpen} />
+      <ToastViewport items={toasts} />
     </>
   );
 }

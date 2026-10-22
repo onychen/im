@@ -20,11 +20,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	goredisv9 "github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
@@ -33,6 +33,7 @@ import (
 	"github.com/goim/goim/internal/config"
 	"github.com/goim/goim/internal/conn"
 	"github.com/goim/goim/internal/consumer"
+	"github.com/goim/goim/internal/idgen"
 	"github.com/goim/goim/internal/infra"
 	"github.com/goim/goim/internal/middleware"
 	goredis "github.com/goim/goim/internal/redis"
@@ -140,19 +141,26 @@ func TestMain(m *testing.M) {
 	// ── 构建仓库层 ──
 	mysqlRepo := repository.NewMySQLRepo(db)
 	redisRepo := repository.NewRedisRepo(rdb)
+	msgCache := repository.NewMessageCache(rdb)
+	relations := repository.NewRelationCache(rdb, mysqlRepo)
 	mqWriter := kafkaClient.NewWriter()
 	mqRepo := repository.NewMQRepo(mqWriter)
 
 	// ── 构建连接管理器 ──
 	cm := conn.NewConnectionManager()
 
+	ids, err := idgen.NewSnowflake(cfg.Message.NodeID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "创建 ID 生成器: %v\n", err)
+		os.Exit(1)
+	}
+
 	// ── 构建服务层 ──
-	msgSvc := service.NewMsgService(redisRepo, mqRepo, cm, logger)
+	msgSvc := service.NewMsgService(mysqlRepo, mysqlRepo, msgCache, relations, mqRepo, ids, cm, logger)
 	authSvc := service.NewAuthService(mysqlRepo, cfg.JWT.Secret, cfg.JWT.AccessExpHours, cfg.JWT.RefreshExpDays)
-	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger)
-	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger)
+	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations)
+	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations, msgSvc)
 	momentSvc := service.NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Duration(cfg.Moment.LikeCacheTTLHours)*time.Hour)
-	msgOpSvc := service.NewMsgOpService(mysqlRepo, redisRepo, logger)
 	settingsSvc := service.NewSettingsService(mysqlRepo, logger)
 
 	// ── 构建 WS 消息分发器 ──
@@ -163,7 +171,8 @@ func TestMain(m *testing.M) {
 	friendHandler := api.NewFriendHandler(friendSvc, rdb)
 	groupHandler := api.NewGroupHandler(groupSvc)
 	momentHandler := api.NewMomentHandler(momentSvc)
-	msgOpHandler := api.NewMsgOpHandler(msgOpSvc)
+	msgOpHandler := api.NewMsgOpHandler(msgSvc)
+	convHandler := api.NewConvHandler(msgSvc)
 	settingsHandler := api.NewSettingsHandler(settingsSvc)
 	uploadHandler := api.NewUploadHandler(cfg.Server.UploadDir, cfg.File.MaxSizeMB, cfg.File.AllowedExts, mysqlRepo)
 	avatarHandler := api.NewAvatarHandler()
@@ -171,20 +180,31 @@ func TestMain(m *testing.M) {
 	// ── 构建 Gin 路由器 ──
 	router := buildRouter(cfg, rdb, cm, dispatcher, logger,
 		authHandler, friendHandler, groupHandler,
-		momentHandler, msgOpHandler, settingsHandler, uploadHandler, avatarHandler)
+		momentHandler, msgOpHandler, convHandler, settingsHandler, uploadHandler, avatarHandler)
 
 	// ── 启动 MQ 消费者 ──
 	consumerCtx, consumerCancel := context.WithCancel(ctx)
-	privateMsgConsumer := consumer.NewPrivateMsgConsumer(kafkaClient.NewReader(infra.TopicPrivateMsgPersist, infra.GroupPrivateMsg), mysqlRepo, redisRepo, cm, logger)
-	groupMsgConsumer := consumer.NewGroupMsgConsumer(kafkaClient.NewReader(infra.TopicGroupMsgFanout, infra.GroupGroupMsg), mysqlRepo, redisRepo, cm, logger)
+	msgDLQ := consumer.DeadLetterPolicy{
+		MaxAttempts: consumer.DefaultDeadLetterAttempts,
+		Writer:      mqWriter,
+		Topic:       infra.TopicMsgDLQ,
+	}
+	persistConsumer := consumer.NewMsgPersistConsumer(
+		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgPersist),
+		mysqlRepo, logger, cfg.Message.PersistBatchSize, cfg.Message.PersistFlushMs,
+	).WithDeadLetter(msgDLQ)
+	deliverConsumer := consumer.NewMsgDeliverConsumer(
+		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgDeliver),
+		msgSvc, logger,
+	).WithDeadLetter(msgDLQ)
 	momentFeedConsumer := consumer.NewMomentFeedConsumer(kafkaClient.NewReader(infra.TopicMomentPush, infra.GroupMomentFeed), mysqlRepo, redisRepo, logger, cfg.Moment.BigUserFriendThreshold, cfg.Moment.TimelineMaxLen)
 
-	if err := privateMsgConsumer.Start(consumerCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "启动私聊消息消费者: %v\n", err)
+	if err := persistConsumer.Start(consumerCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "启动消息落库消费者: %v\n", err)
 		os.Exit(1)
 	}
-	if err := groupMsgConsumer.Start(consumerCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "启动群组消息消费者: %v\n", err)
+	if err := deliverConsumer.Start(consumerCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "启动消息投递消费者: %v\n", err)
 		os.Exit(1)
 	}
 	if err := momentFeedConsumer.Start(consumerCtx); err != nil {
@@ -237,6 +257,7 @@ func buildRouter(
 	groupHandler *api.GroupHandler,
 	momentHandler *api.MomentHandler,
 	msgOpHandler *api.MsgOpHandler,
+	convHandler *api.ConvHandler,
 	settingsHandler *api.SettingsHandler,
 	uploadHandler *api.UploadHandler,
 	avatarHandler *api.AvatarHandler,
@@ -261,6 +282,7 @@ func buildRouter(
 	groupHandler.RegisterRoutes(protected)
 	momentHandler.RegisterRoutes(protected)
 	msgOpHandler.RegisterRoutes(protected)
+	convHandler.RegisterRoutes(protected)
 	settingsHandler.RegisterRoutes(protected)
 	uploadHandler.RegisterRoutes(protected)
 
@@ -576,37 +598,28 @@ func TestE2E_GroupMessaging(t *testing.T) {
 		ToID:        groupID,
 		MsgType:     1,
 		Content:     "hello group from E2E",
-		Timestamp:   time.Now().Unix(),
+		Timestamp:   time.Now().UnixMilli(),
 	})
 
-	// 读取 serverAck
-	ack := readWSMessageType(t, wsConn1, "serverAck", 10*time.Second)
-	var ackData serverAckData
-	if err := json.Unmarshal(ack.Data, &ackData); err != nil {
-		t.Fatalf("反序列化 serverAck: %v", err)
+	// serverAck 在消息写入 Kafka 后返回，携带会话内 seq
+	ackData := readServerAck(t, wsConn1)
+	groupConvID := fmt.Sprintf("g_%d", groupID)
+	if ackData.ServerMsgID == 0 || ackData.Seq <= 0 || ackData.ConvID != groupConvID {
+		t.Fatalf("群聊 serverAck 不符合预期: %+v", ackData)
 	}
-	if ackData.ServerMsgID == 0 {
-		t.Fatal("期望非零 serverMsgID")
-	}
-	t.Logf("群组消息已确认: serverMsgID=%d groupSeq=%d", ackData.ServerMsgID, ackData.GroupSeq)
+	t.Logf("群组消息已确认: serverMsgID=%d seq=%d", ackData.ServerMsgID, ackData.Seq)
 
-	// 步骤 6：u2 通过 WS 连接，同步消息
+	// 步骤 6：u2 上线后先 convSync，再按 seq 区间补拉
 	wsConn2 := connectWS(t, env.baseURL, u2Token)
 	defer closeWS(t, wsConn2)
-	time.Sleep(500 * time.Millisecond)
-
-	sendWSMessage(t, wsConn2, "syncReq", map[string]interface{}{
-		"lastSyncTime": 0,
-		"batchSize":    100,
-	})
-
-	// 读取同步响应
-	syncMsg := readWSMessage(t, wsConn2, 10*time.Second)
-	dataStr := string(syncMsg.Data)
-	if len(dataStr) > 200 {
-		dataStr = dataStr[:200]
+	view := waitConvMaxSeq(t, wsConn2, groupConvID, ackData.Seq)
+	if view.Unread < 1 {
+		t.Fatalf("u2 应有未读: %+v", view)
 	}
-	t.Logf("u2 同步: type=%s data=%s", syncMsg.Type, dataStr)
+	pulled := pullAll(t, wsConn2, groupConvID, 1, view.MaxSeq)
+	if len(pulled) == 0 || pulled[len(pulled)-1].Content != "hello group from E2E" {
+		t.Fatalf("u2 补拉结果不符合预期: %+v", pulled)
+	}
 }
 
 // TestE2E_PrivateMessaging 测试两个好友之间通过 WS 的私聊消息。
@@ -650,45 +663,34 @@ func TestE2E_PrivateMessaging(t *testing.T) {
 		ToID:        u2ID,
 		MsgType:     1,
 		Content:     "hello from E2E private msg",
-		Timestamp:   time.Now().Unix(),
+		Timestamp:   time.Now().UnixMilli(),
 	})
 
-	// 在 u1 上读取 serverAck
-	ack := readWSMessageType(t, wsConn1, "serverAck", 10*time.Second)
-	var ackData serverAckData
-	if err := json.Unmarshal(ack.Data, &ackData); err != nil {
-		t.Fatalf("反序列化 serverAck: %v", err)
-	}
-	if ackData.ServerMsgID == 0 {
-		t.Fatal("期望非零 serverMsgID")
-	}
-	t.Logf("私聊消息已确认: serverMsgID=%d", ackData.ServerMsgID)
-
-	// u2 应收到消息（推送模型 —— 消费者推送到 u2 的 WS）
-	msgOnU2 := readWSMessageType(t, wsConn2, "msg", 15*time.Second)
-	dataStr := string(msgOnU2.Data)
-	if len(dataStr) > 200 {
-		dataStr = dataStr[:200]
-	}
-	t.Logf("u2 收到消息: data=%s", dataStr)
-
-	// 从 u2 发送 deliverAck
-	var receivedMsg struct {
-		MsgID  int64  `json:"msgId"`
-		ConvID string `json:"convId"`
-	}
-	if err := json.Unmarshal(msgOnU2.Data, &receivedMsg); err == nil && receivedMsg.MsgID > 0 {
-		sendWSMessage(t, wsConn2, "deliverAck", map[string]interface{}{
-			"serverMsgId": receivedMsg.MsgID,
-		})
-	}
-
-	// 从 u2 发送 readAck
 	convID := fmt.Sprintf("p_%d_%d", min64(u1ID, u2ID), max64(u1ID, u2ID))
-	sendWSMessage(t, wsConn2, "readAck", map[string]interface{}{
-		"convId": convID,
-	})
-	t.Logf("u2 发送 readAck, convId=%s", convID)
+	ackData := readServerAck(t, wsConn1)
+	if ackData.ServerMsgID == 0 || ackData.Seq <= 0 || ackData.ConvID != convID {
+		t.Fatalf("私聊 serverAck 不符合预期: %+v", ackData)
+	}
+
+	// deliver 消费者把消息推给在线的 u2，seq 与 serverAck 一致
+	received := readPushedMsg(t, wsConn2, convID)
+	if received.Seq != ackData.Seq || received.MsgID != ackData.ServerMsgID || received.SenderID != u1ID {
+		t.Fatalf("u2 收到的消息与 serverAck 不一致: msg=%+v ack=%+v", received, ackData)
+	}
+
+	// u2 上报已读到该 seq，随后 convSync 中 unread 应为 0
+	sendWSMessage(t, wsConn2, "readAck", map[string]interface{}{"convId": convID, "seq": received.Seq})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		view := waitConvMaxSeq(t, wsConn2, convID, received.Seq)
+		if view.ReadSeq >= received.Seq && view.Unread == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("readAck 未生效: %+v", view)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // TestE2E_MomentFlow 测试动态生命周期：发布 → 点赞 → 评论 → 动态流。
@@ -1130,44 +1132,81 @@ func TestE2E_MessageOperations(t *testing.T) {
 	defer closeWS(t, receiverWS)
 	convID := fmt.Sprintf("p_%d_%d", min64(senderID, receiverID), max64(senderID, receiverID))
 
-	send := func(clientMsgID, content string) int64 {
+	send := func(clientMsgID, content string) serverAckData {
 		sendWSMessage(t, senderWS, "msg", sendMsgData{ClientMsgID: clientMsgID, ConvType: 1, ToID: receiverID, MsgType: 1, Content: content, Timestamp: time.Now().UnixMilli()})
-		ack := readWSMessageType(t, senderWS, "serverAck", 10*time.Second)
-		var ackData serverAckData
-		if err := json.Unmarshal(ack.Data, &ackData); err != nil {
-			t.Fatalf("parse server acknowledgement: %v", err)
+		ack := readServerAck(t, senderWS)
+		if ack.ServerMsgID == 0 || ack.Seq <= 0 {
+			t.Fatalf("unexpected server ack: %+v", ack)
 		}
-		if ackData.ServerMsgID == 0 {
-			t.Fatal("expected server message ID")
-		}
-		readWSMessageType(t, receiverWS, "msg", 10*time.Second)
-		return ackData.ServerMsgID
+		readPushedMsg(t, receiverWS, convID)
+		return ack
 	}
 
-	firstID := send(fmt.Sprintf("e2e_msgop_search_%d", time.Now().UnixNano()), "searchable integration message")
-	// serverAck 只在消费者完成 Redis/MySQL 写入后发送，因此这里无需等待即可查询和撤回。
-	status, body = doAuthedRequest(t, http.MethodGet, env.baseURL, "/api/v1/msg/search?q=searchable&limit=10", nil, senderToken)
-	if status != http.StatusOK {
-		t.Fatalf("search messages: status=%d body=%s", status, body)
-	}
-	status, body = doAuthedRequest(t, http.MethodPost, env.baseURL, "/api/v1/msg/revoke", map[string]interface{}{"convId": convID, "msgId": firstID}, senderToken)
+	first := send(fmt.Sprintf("e2e_msgop_search_%d", time.Now().UnixNano()), "searchable integration message")
+	// serverAck 表示已写入 Kafka；检索走 MySQL，需要等 persist 消费者落库。
+	waitUntil(t, 10*time.Second, "search persisted message", func() bool {
+		status, body := doAuthedRequest(t, http.MethodGet, env.baseURL, "/api/v1/msg/search?q=searchable&convId="+convID+"&limit=10", nil, senderToken)
+		if status != http.StatusOK {
+			return false
+		}
+		var resp struct {
+			Msgs []wsMsgData `json:"msgs"`
+		}
+		decodeSuccessResponse(t, body, &resp)
+		for _, m := range resp.Msgs {
+			if m.Seq == first.Seq {
+				return true
+			}
+		}
+		return false
+	})
+
+	// 撤回按 (convId, seq) 定位；撤回本身也是一条 msgType=6 的通知消息
+	status, body = doAuthedRequest(t, http.MethodPost, env.baseURL, "/api/v1/msg/revoke", map[string]interface{}{"convId": convID, "seq": first.Seq}, senderToken)
 	if status != http.StatusOK {
 		t.Fatalf("revoke message: status=%d body=%s", status, body)
 	}
+	notice := readPushedMsg(t, receiverWS, convID)
+	if notice.MsgType != 6 || notice.Seq <= first.Seq {
+		t.Fatalf("expected revoke notice after target seq: %+v", notice)
+	}
+	waitUntil(t, 10*time.Second, "revoked status persisted", func() bool {
+		msgs := fetchHistory(t, senderToken, convID, 0, 50)
+		for _, m := range msgs {
+			if m.Seq == first.Seq {
+				return m.Status == 1
+			}
+		}
+		return false
+	})
 
-	secondID := send(fmt.Sprintf("e2e_msgop_delete_%d", time.Now().UnixNano()), "deletable integration message")
-	// 收到 serverAck 后立即删除，验证不存在 MQ 消费时序窗口。
-	status, body = doAuthedRequest(t, http.MethodDelete, env.baseURL, fmt.Sprintf("/api/v1/msg/%d?convId=%s", secondID, convID), nil, senderToken)
+	second := send(fmt.Sprintf("e2e_msgop_delete_%d", time.Now().UnixNano()), "deletable integration message")
+	status, body = doAuthedRequest(t, http.MethodDelete, env.baseURL, fmt.Sprintf("/api/v1/msg/%d?convId=%s", second.Seq, convID), nil, senderToken)
 	if status != http.StatusOK {
 		t.Fatalf("delete message: status=%d body=%s", status, body)
 	}
+	// 单条删除只对自己生效：发送方历史中不再出现，接收方仍可见
+	waitUntil(t, 10*time.Second, "receiver sees second message", func() bool {
+		for _, m := range fetchHistory(t, receiverToken, convID, 0, 50) {
+			if m.Seq == second.Seq {
+				return true
+			}
+		}
+		return false
+	})
+	for _, m := range fetchHistory(t, senderToken, convID, 0, 50) {
+		if m.Seq == second.Seq {
+			t.Fatalf("deleted message still visible to sender: %+v", m)
+		}
+	}
 }
 
-func TestE2E_SyncCompositeCursorSameTimestamp(t *testing.T) {
+// TestE2E_ConvSyncAndSeqPull 验证 seq 连续分配、convSync 返回 maxSeq、pullMsgs 按区间分页补拉。
+func TestE2E_ConvSyncAndSeqPull(t *testing.T) {
 	stamp := time.Now().UnixNano()
 	senderName := fmt.Sprintf("e2e_sync_sender_%d", stamp)
 	receiverName := fmt.Sprintf("e2e_sync_receiver_%d", stamp)
-	registerUser(t, env.baseURL, senderName, "pass1234")
+	senderID := registerUser(t, env.baseURL, senderName, "pass1234")
 	receiverID := registerUser(t, env.baseURL, receiverName, "pass1234")
 	senderToken := loginUser(t, env.baseURL, senderName, "pass1234")
 	receiverToken := loginUser(t, env.baseURL, receiverName, "pass1234")
@@ -1184,71 +1223,175 @@ func TestE2E_SyncCompositeCursorSameTimestamp(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("accept sync friendship: status=%d body=%s", status, body)
 	}
+	convID := fmt.Sprintf("p_%d_%d", min64(senderID, receiverID), max64(senderID, receiverID))
 
+	// 接收方离线时发送 3 条消息，seq 必须连续递增
 	senderWS := connectWS(t, env.baseURL, senderToken)
 	defer closeWS(t, senderWS)
-	receiverWS := connectWS(t, env.baseURL, receiverToken)
-	defer closeWS(t, receiverWS)
-	sharedTimestamp := time.Now().UnixMilli()
-	sentIDs := make([]int64, 0, 3)
+	seqs := make([]int64, 0, 3)
 	for i := 0; i < 3; i++ {
 		sendWSMessage(t, senderWS, "msg", sendMsgData{
 			ClientMsgID: fmt.Sprintf("e2e-sync-%d-%d", stamp, i),
 			ConvType:    1,
 			ToID:        receiverID,
 			MsgType:     1,
-			Content:     fmt.Sprintf("same timestamp %d", i),
-			Timestamp:   sharedTimestamp,
+			Content:     fmt.Sprintf("offline %d", i),
+			Timestamp:   time.Now().UnixMilli(),
 		})
-		ack := readWSMessageType(t, senderWS, "serverAck", 10*time.Second)
-		var ackData serverAckData
-		if err := json.Unmarshal(ack.Data, &ackData); err != nil {
-			t.Fatalf("parse sync message ack: %v", err)
+		seqs = append(seqs, readServerAck(t, senderWS).Seq)
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] != seqs[i-1]+1 {
+			t.Fatalf("seq should be contiguous: %v", seqs)
 		}
-		sentIDs = append(sentIDs, ackData.ServerMsgID)
-		readWSMessageType(t, receiverWS, "msg", 10*time.Second)
 	}
 
-	type syncBatchData struct {
-		Messages []struct {
-			MsgID int64 `json:"msgId"`
-		} `json:"msgs"`
-		HasMore   bool  `json:"hasMore"`
-		SyncTime  int64 `json:"syncTime"`
-		SyncMsgID int64 `json:"syncMsgId"`
-	}
-	sendWSMessage(t, receiverWS, "syncReq", map[string]interface{}{
-		"lastSyncTime": sharedTimestamp,
-		"batchSize":    2,
+	// 同一 clientMsgId 重发应返回相同的 serverAck（幂等）
+	sendWSMessage(t, senderWS, "msg", sendMsgData{
+		ClientMsgID: fmt.Sprintf("e2e-sync-%d-%d", stamp, 2),
+		ConvType:    1,
+		ToID:        receiverID,
+		MsgType:     1,
+		Content:     "offline 2",
+		Timestamp:   time.Now().UnixMilli(),
 	})
-	firstRaw := readWSMessageType(t, receiverWS, "syncBatch", 10*time.Second)
-	var first syncBatchData
-	if err := json.Unmarshal(firstRaw.Data, &first); err != nil {
-		t.Fatalf("parse first sync page: %v", err)
-	}
-	readWSMessageType(t, receiverWS, "convSync", 10*time.Second)
-	if len(first.Messages) != 2 || !first.HasMore || first.SyncTime != sharedTimestamp || first.SyncMsgID == 0 {
-		t.Fatalf("first sync page mismatch: %+v", first)
+	if dup := readServerAck(t, senderWS); dup.Seq != seqs[2] {
+		t.Fatalf("duplicate send should reuse seq: got=%d want=%d", dup.Seq, seqs[2])
 	}
 
-	sendWSMessage(t, receiverWS, "syncReq", map[string]interface{}{
-		"lastSyncTime":  first.SyncTime,
-		"lastSyncMsgId": first.SyncMsgID,
-		"batchSize":     2,
+	// 接收方上线：convSync 拿到 maxSeq，再用 pullMsgs 分页补拉
+	receiverWS := connectWS(t, env.baseURL, receiverToken)
+	defer closeWS(t, receiverWS)
+	view := waitConvMaxSeq(t, receiverWS, convID, seqs[2])
+	if view.Unread < 3 {
+		t.Fatalf("receiver should have 3 unread: %+v", view)
+	}
+	pulled := pullAll(t, receiverWS, convID, seqs[0], seqs[2])
+	got := make([]int64, 0, len(pulled))
+	for _, m := range pulled {
+		got = append(got, m.Seq)
+	}
+	if !reflect.DeepEqual(got, seqs) {
+		t.Fatalf("pulled seqs mismatch: got=%v want=%v", got, seqs)
+	}
+
+	// HTTP 历史分页：beforeSeq 倒序翻页
+	waitUntil(t, 10*time.Second, "history persisted", func() bool {
+		return len(fetchHistory(t, receiverToken, convID, 0, 50)) >= 3
 	})
-	secondRaw := readWSMessageType(t, receiverWS, "syncBatch", 10*time.Second)
-	var second syncBatchData
-	if err := json.Unmarshal(secondRaw.Data, &second); err != nil {
-		t.Fatalf("parse second sync page: %v", err)
+	page := fetchHistory(t, receiverToken, convID, seqs[2], 2)
+	if len(page) != 2 {
+		t.Fatalf("history page before seq=%d should have 2 msgs: %+v", seqs[2], page)
 	}
-	if len(second.Messages) != 1 || second.HasMore {
-		t.Fatalf("second sync page mismatch: %+v", second)
+	for _, m := range page {
+		if m.Seq >= seqs[2] {
+			t.Fatalf("history page should only contain seq < %d: %+v", seqs[2], page)
+		}
 	}
+}
 
-	got := []int64{first.Messages[0].MsgID, first.Messages[1].MsgID, second.Messages[0].MsgID}
-	sort.Slice(sentIDs, func(i, j int) bool { return sentIDs[i] < sentIDs[j] })
-	if !reflect.DeepEqual(got, sentIDs) {
-		t.Fatalf("sync pages duplicated or omitted messages: got=%v want=%v", got, sentIDs)
+// ── 消息链路辅助函数 ──
+
+func readServerAck(t *testing.T, conn *websocket.Conn) serverAckData {
+	t.Helper()
+	raw := readWSMessageType(t, conn, "serverAck", 10*time.Second)
+	var ack serverAckData
+	if err := json.Unmarshal(raw.Data, &ack); err != nil {
+		t.Fatalf("parse serverAck: %v", err)
+	}
+	return ack
+}
+
+// readPushedMsg 读取指定会话的下一条推送消息。
+func readPushedMsg(t *testing.T, conn *websocket.Conn, convID string) wsMsgData {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		raw := readWSMessageType(t, conn, "msg", time.Until(deadline))
+		var msg wsMsgData
+		if err := json.Unmarshal(raw.Data, &msg); err != nil {
+			t.Fatalf("parse pushed msg: %v", err)
+		}
+		if msg.ConvID == convID {
+			return msg
+		}
+	}
+	t.Fatalf("no pushed msg for conv %s", convID)
+	return wsMsgData{}
+}
+
+// waitConvMaxSeq 反复发送 convSyncReq，直到目标会话的 maxSeq 达到 minSeq。
+func waitConvMaxSeq(t *testing.T, conn *websocket.Conn, convID string, minSeq int64) convViewData {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		sendWSMessage(t, conn, "convSyncReq", map[string]interface{}{})
+		raw := readWSMessageType(t, conn, "convSync", 10*time.Second)
+		var sync struct {
+			Conversations []convViewData `json:"conversations"`
+		}
+		if err := json.Unmarshal(raw.Data, &sync); err != nil {
+			t.Fatalf("parse convSync: %v", err)
+		}
+		for _, v := range sync.Conversations {
+			if v.ConvID == convID && v.MaxSeq >= minSeq {
+				return v
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("conv %s maxSeq did not reach %d: %+v", convID, minSeq, sync.Conversations)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// pullAll 按 seq 区间补拉，hasMore 时从最后一条的下一个 seq 继续。
+func pullAll(t *testing.T, conn *websocket.Conn, convID string, fromSeq, toSeq int64) []wsMsgData {
+	t.Helper()
+	var all []wsMsgData
+	for fromSeq <= toSeq {
+		sendWSMessage(t, conn, "pullMsgs", map[string]interface{}{"convId": convID, "fromSeq": fromSeq, "toSeq": toSeq})
+		raw := readWSMessageType(t, conn, "pullMsgsResp", 10*time.Second)
+		var resp pullMsgsRespData
+		if err := json.Unmarshal(raw.Data, &resp); err != nil {
+			t.Fatalf("parse pullMsgsResp: %v", err)
+		}
+		all = append(all, resp.Msgs...)
+		if !resp.HasMore || len(resp.Msgs) == 0 {
+			break
+		}
+		fromSeq = resp.Msgs[len(resp.Msgs)-1].Seq + 1
+	}
+	return all
+}
+
+// fetchHistory 通过 HTTP 拉取历史消息；beforeSeq=0 表示从最新开始。
+func fetchHistory(t *testing.T, token, convID string, beforeSeq int64, limit int) []wsMsgData {
+	t.Helper()
+	path := fmt.Sprintf("/api/v1/conversations/%s/messages?limit=%d", convID, limit)
+	if beforeSeq > 0 {
+		path += fmt.Sprintf("&beforeSeq=%d", beforeSeq)
+	}
+	status, body := doAuthedRequest(t, http.MethodGet, env.baseURL, path, nil, token)
+	if status != http.StatusOK {
+		t.Fatalf("fetch history: status=%d body=%s", status, body)
+	}
+	var resp struct {
+		Msgs    []wsMsgData `json:"msgs"`
+		HasMore bool        `json:"hasMore"`
+	}
+	decodeSuccessResponse(t, body, &resp)
+	return resp.Msgs
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

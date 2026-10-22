@@ -1,0 +1,24 @@
+-- 015: 删除改造前的旧消息表。
+-- 默认全部注释：确认 014 迁移结果无误（条数、seq 连续性、撤回状态）后，再手工取消注释执行。
+--
+-- 校验参考：
+--   SELECT COUNT(*) FROM private_messages;                -- 应等于 messages 中 conv_type=1 的条数
+--   SELECT COUNT(*) FROM messages WHERE conv_type = 1;
+--   SELECT COUNT(*) FROM group_messages;                  -- 应等于 messages 中 conv_type=2 的条数
+--   SELECT COUNT(*) FROM messages WHERE conv_type = 2;
+--   SELECT COUNT(*) FROM msg_revoked;                     -- 应不大于 messages 中 status=1 的条数
+--   SELECT COUNT(*) FROM messages WHERE status = 1;
+
+-- DROP TABLE IF EXISTS msg_revoked;
+-- DROP TABLE IF EXISTS group_messages;
+-- DROP TABLE IF EXISTS private_messages;
+
+-- Redis 旧 key 清理（在 redis-cli 中执行，按需调整 COUNT）：
+--   redis-cli --scan --pattern 'inbox:*'          | xargs -r redis-cli del
+--   redis-cli --scan --pattern 'outbox:*'         | xargs -r redis-cli del
+--   redis-cli --scan --pattern 'conv_list:*'      | xargs -r redis-cli del
+--   redis-cli --scan --pattern 'unread:*'         | xargs -r redis-cli del
+--   redis-cli --scan --pattern 'group_read_pos:*' | xargs -r redis-cli del
+--   redis-cli --scan --pattern 'group_seq:*'      | xargs -r redis-cli del
+--   redis-cli --scan --pattern 'user_groups:*'    | xargs -r redis-cli del
+--   redis-cli del msg_stream

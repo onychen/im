@@ -11,7 +11,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/goim/goim/internal/model"
-	"github.com/goim/goim/internal/redis"
 	"github.com/goim/goim/internal/repository"
 )
 
@@ -165,15 +164,6 @@ func (m *mockGroupMySQLRepo) CreateUser(_ context.Context, _ *model.User) error 
 func (m *mockGroupMySQLRepo) UpdateUser(_ context.Context, _ *model.User) error { return nil }
 func (m *mockGroupMySQLRepo) DeleteMoment(_ context.Context, _ int64) error     { return nil }
 
-func (m *mockGroupMySQLRepo) InsertPrivateMessage(_ context.Context, _ *model.PrivateMessage) error {
-	return nil
-}
-func (m *mockGroupMySQLRepo) InsertGroupMessage(_ context.Context, _ *model.GroupMessage) error {
-	return nil
-}
-func (m *mockGroupMySQLRepo) InsertMsgRevoked(_ context.Context, _ *model.MsgRevoked) error {
-	return nil
-}
 
 func (m *mockGroupMySQLRepo) CreateFriendRequest(_ context.Context, _ *model.FriendRequest) error {
 	return nil
@@ -236,159 +226,21 @@ func (m *mockGroupMySQLRepo) GetUserSettings(_ context.Context, _ int64) (*model
 func (m *mockGroupMySQLRepo) CreateOrUpdateUserSettings(_ context.Context, _ *model.UserSettings) error {
 	return nil
 }
-func (m *mockGroupMySQLRepo) SearchPrivateMessages(_ context.Context, _ int64, _ string, _ int, _ int) ([]model.PrivateMessage, error) {
-	return nil, nil
-}
 
 // ──────────────────────────────────────────────────────
 // 模拟 RedisRepo 用于群组测试
 // ──────────────────────────────────────────────────────
 
-type mockGroupRedisRepo struct {
-	mu sync.Mutex
-
-	// group_members:{groupID} -> userID 字符串集合
-	groupMembersSets map[int64]map[string]bool
-	// user_groups:{userID} -> groupID 字符串集合
-	userGroupsSets map[int64]map[string]bool
-
-	// 错误覆盖项
-	addGroupMemberErr    error
-	removeGroupMemberErr error
-}
+type mockGroupRedisRepo struct{}
 
 func newMockGroupRedisRepo() *mockGroupRedisRepo {
-	return &mockGroupRedisRepo{
-		groupMembersSets: make(map[int64]map[string]bool),
-		userGroupsSets:   make(map[int64]map[string]bool),
-	}
+	return &mockGroupRedisRepo{}
 }
 
-func (r *mockGroupRedisRepo) GetGroupMemberships(_ context.Context, userID int64) ([]int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	set, ok := r.userGroupsSets[userID]
-	if !ok {
-		return []int64{}, nil
-	}
-	result := make([]int64, 0, len(set))
-	for k := range set {
-		id, _ := fmt.Sscanf(k, "%d", new(int64))
-		_ = id
-		result = append(result, 0) // 简化处理
-	}
-	return result, nil
-}
+// ── 存根：所有 RedisRepo 方法 ──
 
-func (r *mockGroupRedisRepo) GetGroupMembers(_ context.Context, groupID int64) ([]int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	set, ok := r.groupMembersSets[groupID]
-	if !ok {
-		return []int64{}, nil
-	}
-	result := make([]int64, 0, len(set))
-	for k := range set {
-		var id int64
-		fmt.Sscanf(k, "%d", &id)
-		result = append(result, id)
-	}
-	return result, nil
-}
-
-func (r *mockGroupRedisRepo) AddGroupMemberRedis(_ context.Context, groupID, userID int64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.addGroupMemberErr != nil {
-		return r.addGroupMemberErr
-	}
-	userIDStr := fmt.Sprintf("%d", userID)
-	groupIDStr := fmt.Sprintf("%d", groupID)
-
-	if r.groupMembersSets[groupID] == nil {
-		r.groupMembersSets[groupID] = make(map[string]bool)
-	}
-	r.groupMembersSets[groupID][userIDStr] = true
-
-	if r.userGroupsSets[userID] == nil {
-		r.userGroupsSets[userID] = make(map[string]bool)
-	}
-	r.userGroupsSets[userID][groupIDStr] = true
-	return nil
-}
-
-func (r *mockGroupRedisRepo) RemoveGroupMemberRedis(_ context.Context, groupID, userID int64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.removeGroupMemberErr != nil {
-		return r.removeGroupMemberErr
-	}
-	userIDStr := fmt.Sprintf("%d", userID)
-	groupIDStr := fmt.Sprintf("%d", groupID)
-
-	delete(r.groupMembersSets[groupID], userIDStr)
-	delete(r.userGroupsSets[userID], groupIDStr)
-	return nil
-}
-
-// ── 存根：所有其他 RedisRepo 方法 ──
-
-func (r *mockGroupRedisRepo) WriteInbox(_ context.Context, _ int64, _ *model.InboxMessage) error {
-	return nil
-}
-func (r *mockGroupRedisRepo) WriteOutbox(_ context.Context, _ int64, _ *model.InboxMessage) error {
-	return nil
-}
-func (r *mockGroupRedisRepo) ReadInbox(_ context.Context, _ int64, _, _ int64, _ int) ([]model.InboxMessage, error) {
-	return nil, nil
-}
-func (r *mockGroupRedisRepo) ReadOutbox(_ context.Context, _ int64, _, _ int64, _ int) ([]model.InboxMessage, error) {
-	return nil, nil
-}
-func (r *mockGroupRedisRepo) UpdateConvList(_ context.Context, _ int64, _ string, _ string, _ int64) error {
-	return nil
-}
-func (r *mockGroupRedisRepo) GetConvList(_ context.Context, _ int64) ([]model.ConvSummary, error) {
-	return nil, nil
-}
-func (r *mockGroupRedisRepo) IncrementUnread(_ context.Context, _ int64, _ string) error { return nil }
-func (r *mockGroupRedisRepo) ClearUnread(_ context.Context, _ int64, _ string) error     { return nil }
-func (r *mockGroupRedisRepo) GetUnreadMap(_ context.Context, _ int64) (map[string]int64, error) {
-	return nil, nil
-}
-func (r *mockGroupRedisRepo) SetGroupReadPos(_ context.Context, _ int64, _ string, _ int64) error {
-	return nil
-}
-func (r *mockGroupRedisRepo) GetGroupReadPos(_ context.Context, _ int64, _ string) (int64, error) {
-	return 0, nil
-}
-
-func (r *mockGroupRedisRepo) GetGroupSeq(_ context.Context, _ int64) (int64, error) { return 0, nil }
-func (r *mockGroupRedisRepo) CheckDuplicate(_ context.Context, _ int64, _ string) (bool, error) {
-	return false, nil
-}
-func (r *mockGroupRedisRepo) TrimInbox(_ context.Context, _ int64, _ int) error          { return nil }
-func (r *mockGroupRedisRepo) TrimOutbox(_ context.Context, _ int64, _ int) error         { return nil }
-func (r *mockGroupRedisRepo) TrimInboxByTime(_ context.Context, _ int64, _ int64) error  { return nil }
-func (r *mockGroupRedisRepo) TrimOutboxByTime(_ context.Context, _ int64, _ int64) error { return nil }
-func (r *mockGroupRedisRepo) TrimConvListByTime(_ context.Context, _ int64, _ int64) error {
-	return nil
-}
 func (r *mockGroupRedisRepo) TrimTimelineByTime(_ context.Context, _ int64, _ int64) error {
 	return nil
-}
-
-func (r *mockGroupRedisRepo) ExecPrivateMsgCheck(_ context.Context, _ int64, _ int64, _ string) (*redis.PrivateMsgCheckResult, error) {
-	return nil, nil
-}
-func (r *mockGroupRedisRepo) ExecGroupMsgCheck(_ context.Context, _ int64, _ int64, _ string) (*redis.GroupMsgCheckResult, error) {
-	return nil, nil
-}
-func (r *mockGroupRedisRepo) ExecInboxMarkRead(_ context.Context, _ int64, _ string) (int64, error) {
-	return 0, nil
-}
-func (r *mockGroupRedisRepo) ExecRevokeMsg(_ context.Context, _ int64, _ string, _ int64, _ string, _ int64) (bool, error) {
-	return false, nil
 }
 func (r *mockGroupRedisRepo) PublishMomentFeed(_ context.Context, _ int64, _ int64, _ int64) error {
 	return nil
@@ -412,7 +264,6 @@ func (r *mockGroupRedisRepo) GetTimelinePage(_ context.Context, _ int64, _ int64
 func (r *mockGroupRedisRepo) GetOutboxPage(_ context.Context, _ int64, _ int64, _ int64, _ int) ([]model.FeedEntry, error) {
 	return nil, nil
 }
-func (r *mockGroupRedisRepo) SetFriendCache(_ context.Context, _ int64, _ int64) error { return nil }
 
 // ──────────────────────────────────────────────────────
 // 辅助：验证 mockMySQLRepo 满足 MySQLRepo 接口
@@ -459,14 +310,69 @@ func TestGroup_CreateGroup_Success(t *testing.T) {
 	assert.Len(t, members, 1)
 	assert.Equal(t, int64(1), members[0].UserID)
 	assert.Equal(t, 2, members[0].Role)
+}
 
-	// 验证 Redis 缓存已更新
-	redisRepo.mu.Lock()
-	groupMembers := redisRepo.groupMembersSets[1]
-	userGroups := redisRepo.userGroupsSets[1]
-	redisRepo.mu.Unlock()
-	assert.True(t, groupMembers["1"])
-	assert.True(t, userGroups["1"])
+func TestGroup_CreateGroup_CreatesConversationAndInvalidates(t *testing.T) {
+	mysqlRepo := newMockGroupMySQLRepo()
+	store := newRecordingMessageStore()
+	relations := &recordingRelations{}
+	svc := newTestGroupService(mysqlRepo, newMockGroupRedisRepo()).WithMessaging(store, relations, nil)
+
+	groupID, err := svc.CreateGroup(context.Background(), 1, "TestGroup", "")
+	assert.NoError(t, err)
+
+	convID := model.BuildConvID(model.ConvTypeGroup, groupID, 0)
+	assert.Equal(t, model.ConvTypeGroup, store.ensuredConvs[convID])
+	assert.Equal(t, []int64{1}, store.userConvs[convID])
+	assert.Equal(t, int64(1), store.joinMinSeq[convID][1], "新群从 seq=1 开始可见")
+	assert.Contains(t, relations.groupInvalidations, groupID)
+}
+
+func TestGroup_AddMember_SetsMinSeqToCurrentPlusOne(t *testing.T) {
+	mysqlRepo := newMockGroupMySQLRepo()
+	store := newRecordingMessageStore()
+	seqs := fakeSeqReader{}
+	svc := newTestGroupService(mysqlRepo, newMockGroupRedisRepo()).WithMessaging(store, &recordingRelations{}, seqs)
+
+	groupID, _ := svc.CreateGroup(context.Background(), 1, "Group", "")
+	convID := model.BuildConvID(model.ConvTypeGroup, groupID, 0)
+	seqs[convID] = 42 // 群里已经有 42 条消息
+
+	assert.NoError(t, svc.AddMember(context.Background(), groupID, 1, 2))
+	assert.Equal(t, int64(43), store.joinMinSeq[convID][2], "新成员看不到入群前的历史，也不计未读")
+	assert.Equal(t, int64(1), store.joinMinSeq[convID][1], "群主的可见下界不受影响")
+}
+
+func TestGroup_AddAndRemoveMember_SyncsUserConversations(t *testing.T) {
+	mysqlRepo := newMockGroupMySQLRepo()
+	store := newRecordingMessageStore()
+	relations := &recordingRelations{}
+	svc := newTestGroupService(mysqlRepo, newMockGroupRedisRepo()).WithMessaging(store, relations, nil)
+
+	groupID, _ := svc.CreateGroup(context.Background(), 1, "Group", "")
+	assert.NoError(t, svc.AddMember(context.Background(), groupID, 1, 2))
+	convID := model.BuildConvID(model.ConvTypeGroup, groupID, 0)
+	assert.ElementsMatch(t, []int64{1, 2}, store.userConvs[convID])
+
+	before := len(relations.groupInvalidations)
+	assert.NoError(t, svc.RemoveMember(context.Background(), groupID, 1, 2))
+	assert.Equal(t, [][2]interface{}{{int64(2), convID}}, store.deletedUserConv)
+	assert.Greater(t, len(relations.groupInvalidations), before)
+}
+
+func TestGroup_ListUserGroups_FromStore(t *testing.T) {
+	mysqlRepo := newMockGroupMySQLRepo()
+	store := newRecordingMessageStore()
+	svc := newTestGroupService(mysqlRepo, newMockGroupRedisRepo()).WithMessaging(store, nil, nil)
+
+	groupID, _ := svc.CreateGroup(context.Background(), 1, "Group", "")
+	store.userGroupIDs[1] = []int64{groupID}
+
+	groups, err := svc.ListUserGroups(context.Background(), 1)
+	assert.NoError(t, err)
+	if assert.Len(t, groups, 1) {
+		assert.Equal(t, "Group", groups[0].Name)
+	}
 }
 
 // ──────────────────────────────────────────────────────

@@ -32,6 +32,18 @@ type GroupService struct {
 	mysqlRepo repository.MySQLRepo
 	redisRepo repository.RedisRepo
 	logger    *zap.Logger
+
+	// store 维护群会话与成员的 user_conversations；relations 在成员变化后失效群成员缓存；
+	// seqs 提供会话当前 seq，用于给新成员设置可见下界。
+	// 通过 WithMessaging 注入，为空时跳过（便于单元测试）。
+	store     repository.MessageStore
+	relations repository.RelationCache
+	seqs      ConvSeqReader
+}
+
+// ConvSeqReader 返回会话当前已分配的最大 seq，由 *MsgService 实现。
+type ConvSeqReader interface {
+	CurrentSeq(ctx context.Context, convID string) (int64, error)
 }
 
 // NewGroupService 使用给定的仓库和日志记录器创建一个 GroupService。
@@ -43,8 +55,69 @@ func NewGroupService(mysqlRepo repository.MySQLRepo, redisRepo repository.RedisR
 	}
 }
 
+// WithMessaging 注入会话存储、关系缓存与 seq 来源。
+func (s *GroupService) WithMessaging(store repository.MessageStore, relations repository.RelationCache, seqs ConvSeqReader) *GroupService {
+	s.store = store
+	s.relations = relations
+	s.seqs = seqs
+	return s
+}
+
+// onMemberJoined 在成员写入 MySQL 后调用：失效成员缓存并为新成员创建 user_conversations。
+// 新成员的 min_seq 设为当前 seq+1：入群前的历史不可见，也不计入未读（与主流 IM 一致）。
+// 缓存失效失败会让被移除/新增的成员在 TTL 内鉴权结果过期，因此作为错误返回。
+func (s *GroupService) onMemberJoined(ctx context.Context, groupID int64, userIDs ...int64) error {
+	if err := s.invalidateMembers(ctx, groupID); err != nil {
+		return err
+	}
+	if s.store == nil {
+		return nil
+	}
+	convID := model.BuildConvID(model.ConvTypeGroup, groupID, 0)
+	if err := s.store.EnsureConversation(ctx, convID, model.ConvTypeGroup); err != nil {
+		return fmt.Errorf("ensure group conversation: %w", err)
+	}
+	var cur int64
+	if s.seqs != nil {
+		seq, err := s.seqs.CurrentSeq(ctx, convID)
+		if err != nil {
+			return fmt.Errorf("read group conversation seq: %w", err)
+		}
+		cur = seq
+	}
+	if err := s.store.JoinConversation(ctx, convID, userIDs, cur+1); err != nil {
+		return fmt.Errorf("join group conversation: %w", err)
+	}
+	return nil
+}
+
+// onMemberLeft 在成员从 MySQL 删除后调用：失效成员缓存并移除该成员的 user_conversations。
+func (s *GroupService) onMemberLeft(ctx context.Context, groupID, userID int64) error {
+	if err := s.invalidateMembers(ctx, groupID); err != nil {
+		return err
+	}
+	if s.store == nil {
+		return nil
+	}
+	convID := model.BuildConvID(model.ConvTypeGroup, groupID, 0)
+	if err := s.store.DeleteUserConversation(ctx, userID, convID); err != nil {
+		s.logger.Warn("删除成员群会话失败", zap.Int64("userID", userID), zap.String("convId", convID), zap.Error(err))
+	}
+	return nil
+}
+
+func (s *GroupService) invalidateMembers(ctx context.Context, groupID int64) error {
+	if s.relations == nil {
+		return nil
+	}
+	if err := s.relations.InvalidateGroupMembers(ctx, groupID); err != nil {
+		return fmt.Errorf("invalidate group members cache: %w", err)
+	}
+	return nil
+}
+
 // CreateGroup 创建一个新群组，将群主添加为 role=2（群主）的成员，
-// 并更新 Redis 缓存。返回新的 groupID。
+// 并初始化群会话。返回新的 groupID。
 func (s *GroupService) CreateGroup(ctx context.Context, ownerID int64, name, notice string) (int64, error) {
 	group := &model.Group{
 		Name:    name,
@@ -66,9 +139,8 @@ func (s *GroupService) CreateGroup(ctx context.Context, ownerID int64, name, not
 		return 0, fmt.Errorf("add owner as group member: %w", err)
 	}
 
-	// 更新 Redis 缓存
-	if err := s.redisRepo.AddGroupMemberRedis(ctx, groupID, ownerID); err != nil {
-		return 0, fmt.Errorf("sync owner membership to redis: %w", err)
+	if err := s.onMemberJoined(ctx, groupID, ownerID); err != nil {
+		return 0, err
 	}
 
 	return groupID, nil
@@ -110,7 +182,10 @@ func (s *GroupService) GetGroupInfo(ctx context.Context, groupID int64) (*model.
 }
 
 func (s *GroupService) ListUserGroups(ctx context.Context, userID int64) ([]model.Group, error) {
-	ids, err := s.redisRepo.GetGroupMemberships(ctx, userID)
+	if s.store == nil {
+		return nil, fmt.Errorf("get user groups: message store not configured")
+	}
+	ids, err := s.store.ListUserGroupIDs(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("get user groups: %w", err)
 	}
@@ -184,12 +259,9 @@ func (s *GroupService) AddMember(ctx context.Context, groupID, userID, newMember
 		return fmt.Errorf("add group member: %w", err)
 	}
 
-	// 更新 Redis 缓存
-	if err := s.redisRepo.AddGroupMemberRedis(ctx, groupID, newMemberID); err != nil {
-		// Returning success here would leave the send-time Lua authorization
-		// cache stale.  The caller must retry/repair instead of believing the
-		// member can already send messages.
-		return fmt.Errorf("sync group membership to redis: %w", err)
+	// 先写 DB 再失效缓存，发送鉴权下一次读取时回源拿到新成员
+	if err := s.onMemberJoined(ctx, groupID, newMemberID); err != nil {
+		return err
 	}
 
 	return nil
@@ -236,14 +308,12 @@ func (s *GroupService) RemoveMember(ctx context.Context, groupID, userID, remove
 		return fmt.Errorf(ErrCannotRemoveOwner)
 	}
 
-	// Remove Redis authorization first.  Once this returns, a removed user can
-	// no longer pass the send-time Lua membership check, even if the following
-	// MySQL write is temporarily unavailable.
-	if err := s.redisRepo.RemoveGroupMemberRedis(ctx, groupID, removeMemberID); err != nil {
-		return fmt.Errorf("sync group member removal to redis: %w", err)
-	}
+	// Cache-Aside：先删 DB 再失效群成员缓存，之后的发送鉴权会回源 MySQL
 	if err := s.mysqlRepo.RemoveGroupMember(ctx, groupID, removeMemberID); err != nil {
-		return fmt.Errorf("remove group member after redis authorization removal: %w", err)
+		return fmt.Errorf("remove group member: %w", err)
+	}
+	if err := s.onMemberLeft(ctx, groupID, removeMemberID); err != nil {
+		return err
 	}
 
 	return nil
@@ -356,7 +426,7 @@ func (s *GroupService) TransferOwnership(ctx context.Context, groupID, ownerID, 
 	if err := s.mysqlRepo.UpdateGroup(ctx, group); err != nil {
 		return fmt.Errorf("update group owner: %w", err)
 	}
-	return nil
+	return s.invalidateMembers(ctx, groupID)
 }
 
 // UpdateMemberRole 更改成员的角色。userID 必须是群主。
@@ -388,7 +458,7 @@ func (s *GroupService) UpdateMemberRole(ctx context.Context, groupID, userID, ta
 	if err := s.mysqlRepo.UpdateGroupMemberRole(ctx, int(groupID), int(targetUserID), int(newRole)); err != nil {
 		return fmt.Errorf("update member role: %w", err)
 	}
-	return nil
+	return s.invalidateMembers(ctx, groupID)
 }
 
 // LeaveGroup 允许用户退出群组。群主不能退出（必须先转让群主或解散群组）。
@@ -420,12 +490,11 @@ func (s *GroupService) LeaveGroup(ctx context.Context, groupID, userID int64) er
 		return fmt.Errorf(ErrMemberNotFound)
 	}
 
-	// Same ordering as kick/removal: authorization must be revoked first.
-	if err := s.redisRepo.RemoveGroupMemberRedis(ctx, groupID, userID); err != nil {
-		return fmt.Errorf("sync group leave to redis: %w", err)
-	}
 	if err := s.mysqlRepo.RemoveGroupMember(ctx, groupID, userID); err != nil {
-		return fmt.Errorf("leave group after redis authorization removal: %w", err)
+		return fmt.Errorf("leave group: %w", err)
+	}
+	if err := s.onMemberLeft(ctx, groupID, userID); err != nil {
+		return err
 	}
 
 	return nil

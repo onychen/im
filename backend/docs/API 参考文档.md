@@ -520,34 +520,106 @@ GET /ws?token=<access_token>
 
 ---
 
+## 会话（需要 JWT）
+
+消息模型：私聊与群聊统一为会话（`p_{小}_{大}` / `g_{gid}`），会话内 `seq` 单调递增，`convId + seq` 唯一定位一条消息。
+
+### GET /conversations
+
+返回当前用户全部可见会话。
+
+**响应 (200)：**
+```json
+{
+  "conversations": [
+    {
+      "convId": "p_1_2",
+      "convType": 1,
+      "targetId": 2,
+      "targetName": "bob",
+      "targetAvatar": "/api/v1/avatar/2",
+      "maxSeq": 120,
+      "readSeq": 118,
+      "minSeq": 0,
+      "unread": 2,
+      "lastMsg": { "...": "WsMessage" },
+      "lastMsgBrief": "hello",
+      "lastMsgTime": 1700000000000,
+      "pinned": false,
+      "muted": false
+    }
+  ]
+}
+```
+
+### GET /conversations/:convId/messages?beforeSeq=0&limit=30
+
+按 seq 向前翻页，`beforeSeq=0` 表示从最新开始；`limit` 默认 30，最大 100。结果按 seq 升序。`msgId` / `serverMsgId` / `targetMsgId` 等雪花 ID 一律以字符串返回（数值超过 JS 安全整数 2^53）。
+
+**响应 (200)：**
+```json
+{
+  "msgs": [
+    { "convId": "p_1_2", "seq": 119, "msgId": "372036854775807001", "convType": 1, "fromId": 1, "msgType": 1, "content": "hi", "status": 0, "timestamp": 1700000000000 }
+  ],
+  "hasMore": true
+}
+```
+
+### POST /conversations/:convId/read
+
+把已读位置推进到 `seq`，只前进不回退。
+
+**请求：**
+```json
+{ "seq": 120 }
+```
+
+### POST /conversations/:convId/clear
+
+仅对自己清空聊天记录（之后 `minSeq` 推进到当前 `maxSeq`）。
+
+### DELETE /conversations/:convId
+
+清空记录并从会话列表隐藏；私聊有新消息时会重新出现。
+
+**错误：**
+- `404 / 1404`：会话不存在或无权访问
+
+---
+
 ## 消息操作（需要 JWT）
 
 ### POST /msg/revoke
 
-撤回一条消息（发送后 2 分钟内，仅发送者可撤回）。
+撤回一条消息（发送后 2 分钟内，仅发送者可撤回）。撤回以一条 `msgType=6` 的通知消息写入会话，content 为 `{"targetSeq","targetMsgId","operatorId"}`。
 
 **请求：**
 ```json
 {
   "convId": "p_1_2",
-  "msgId": 100
+  "seq": 119
 }
 ```
 
-**响应 (200)：**
+**响应 (200)：** 撤回通知的 serverAck
 ```json
 {
-  "message": "message revoked"
+  "clientMsgId": "revoke:p_1_2:119",
+  "serverMsgId": "372036854775807002",
+  "convId": "p_1_2",
+  "seq": 121,
+  "timestamp": 1700000060000
 }
 ```
 
 **错误：**
-- `400`：消息不可撤回（超时或已被撤回）
-- `403`：不是消息发送者
+- `400 / 1401`：消息不可撤回（超时或已被撤回）
+- `403 / 1402`：不是消息发送者
 
-### DELETE /msg/:msgID?convId=p_1_2
+### DELETE /msg/:seq?convId=p_1_2
 
-删除一条消息（仅本地删除，对方仍能看到）。
+仅对自己删除一条消息，会话其他成员不受影响。
 
 **响应 (200)：**
 ```json
@@ -556,14 +628,14 @@ GET /ws?token=<access_token>
 }
 ```
 
-### GET /msg/search?q=hello&limit=20&offset=0
+### GET /msg/search?q=hello&convId=p_1_2&limit=20
 
-搜索私聊消息。
+在当前用户可见的文本消息中搜索，私聊和群聊均可；`convId` 可选，`limit` 默认 20，最大 100。
 
 **响应 (200)：**
 ```json
 {
-  "messages": [...]
+  "msgs": [...]
 }
 ```
 
@@ -654,28 +726,28 @@ GET /ws?token=<access_token>
 
 | 类型 | 用途 | 数据字段 |
 |------|------|----------|
-| `msg` | 发送聊天消息 | `msgId`（客户端 ID）、`convType`（1=私聊，2=群聊）、`toId`、`msgType`（1=文本）、`content`、`timestamp` |
-| `deliverAck` | 确认送达 | `serverMsgId` |
-| `readAck` | 标记会话已读 | `convId` |
-| `syncReq` | 请求离线同步 | `lastSyncTime`、`batchSize` |
-| `revokeMsg` | 撤回一条消息 | `convId`、`serverMsgId` |
-| `friendApply` | 好友申请（通过 WS） | （占位） |
-| `ping` | 心跳 | — |
+| `msg` | 发送聊天消息 | `msgId`（clientMsgId，重试复用）、`convType`（1=私聊，2=群聊）、`toId`、`msgType`（1=文本）、`content`、`timestamp`（可选） |
+| `readAck` | 推进已读位置 | `convId`、`seq` |
+| `convSyncReq` | 请求会话视图 | `{}` |
+| `pullMsgs` | 按 seq 区间补拉 | `convId`、`fromSeq`、`toSeq`（<=0 表示到最新，单次最多 100 条） |
+| `revokeMsg` | 撤回一条消息 | `convId`、`seq` |
+
+心跳使用 WebSocket 原生 Ping/Pong，不使用 JSON 消息。
 
 ### 服务端 → 客户端消息
 
 | 类型 | 用途 | 数据字段 |
 |------|------|----------|
-| `serverAck` | 消息已确认 | `clientMsgId`、`serverMsgId`、`groupSeq`（群聊）、`timestamp` |
-| `msg` | 收到的聊天消息 | `msgId`、`convId`、`convType`、`fromId`、`toId`、`msgType`、`content`、`readStatus`（私聊）、`groupSeq`（群聊）、`timestamp` |
-| `syncBatch` | 离线同步批次 | `msgs[]`、`hasMore`、`syncTime` |
-| `convSync` | 会话同步 | `conversations[]`、`unreadMap` |
-| `msgRevoked` | 消息撤回通知 | `convId`、`serverMsgId`、`operatorId` |
-| `kick` | 连接被踢出 | `reason: "new_login"` |
-| `friendAccepted` | 好友申请被接受 | — |
-| `presence` | 在线状态变更 | — |
-| `error` | 错误通知 | `code`、`message` |
-| `pong` | 心跳响应 | — |
+| `serverAck` | 消息已写入 Kafka，seq 已分配 | `clientMsgId`、`serverMsgId`、`convId`、`seq`、`timestamp` |
+| `msg` | 收到的消息（不推给发送者本人） | `convId`、`seq`、`msgId`、`convType`、`fromId`、`msgType`、`content`、`status`（0 正常/1 已撤回）、`clientMsgId`、`timestamp` |
+| `convSync` | 会话视图 | `conversations[]`（含 `maxSeq`、`readSeq`、`minSeq`、`unread` 等） |
+| `pullMsgsResp` | 补拉结果 | `convId`、`fromSeq`、`toSeq`、`watermark`、`msgs[]`、`hasMore`（为 true 时从 `toSeq+1` 继续）。`toSeq` 不超过 `watermark`（已投递水位），水位以下缺失的 seq 是空洞 |
+| `groupAdded` | 被加入群 | `groupId`、`name` |
+| `groupRemoved` | 被移出群 | `groupId`、`reason` |
+| `kick` | 连接被踢出 | `reason: "new_login"`（无 data 信封） |
+| `error` | 错误通知 | `code`、`message`、`clientMsgId`（仅发送/撤回失败时带） |
+
+撤回没有独立帧，而是一条 `msgType=6` 的 `msg`，content 为 `{"targetSeq","targetMsgId","operatorId"}`。
 
 ### 消息类型
 
@@ -685,7 +757,7 @@ GET /ws?token=<access_token>
 | MsgTypeImage | 2 | 图片消息 |
 | MsgTypeVideo | 3 | 视频消息 |
 | MsgTypeSystem | 5 | 系统通知 |
-| MsgTypeRevoked | 6 | 撤回占位符 |
+| MsgTypeRevoked | 6 | 撤回通知 |
 
 ### 会话类型
 

@@ -55,7 +55,16 @@ const (
 	headerDLQOriginalOffset    = "x-original-offset"
 	headerDLQConsumer          = "x-consumer"
 	headerDLQAttempts          = "x-attempts"
+	headerLastError            = "x-last-error"
 )
+
+// truncateContent 把错误信息截断到 maxLen 字节，避免 Kafka header 过大。
+func truncateContent(content string, maxLen int) string {
+	if len(content) <= maxLen {
+		return content
+	}
+	return content[:maxLen] + "..."
+}
 
 // DeadLetterPolicy 控制消息处理的重试上限与死信投递。
 // 零值表示不启用：失败的消息会一直原地退避重试。

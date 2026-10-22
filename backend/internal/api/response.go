@@ -66,6 +66,7 @@ const (
 	CodeMsgNotRevocable   = 1401
 	CodeMsgRevokeNotOwner = 1402
 	CodeMsgDeleteFailed   = 1403
+	CodeConvNotFound      = 1404
 
 	// ── 朋友圈 1500~1599 ──
 	CodeMomentContentEmpty = 1501
@@ -86,8 +87,8 @@ const (
 // ──────────────────────────────────────────────────────
 
 // errorCodeMap 将 service 包定义的 error 常量字符串映射到标准错误码。
-// 注意：私聊/群聊消息相关错误码（4001-4003, 5001-5003）沿用 redis 包中
-// MapLuaErrToClientCode / MapGroupLuaErrToClientCode 的定义，不在此重复。
+// 注意：消息服务（msg_service.go）返回带错误码的 *service.MsgError，
+// HTTP 层通过 msgServiceError 直接使用其 Code；下方消息条目仅供 ServiceError 兜底。
 var errorCodeMap = map[string]int{
 	// 认证
 	"用户名必须为3-50个字符": CodeUsernameTooShort,
@@ -137,13 +138,14 @@ var errorCodeMap = map[string]int{
 	"会话不在静音列表中": CodeMuteConvNotFound,
 	"会话已不可用":    CodeInvalidParam,
 
-	// 消息服务（msg_service.go 中的错误通过 redis 包映射，这里仅做兜底）
+	// 消息服务兜底（与 service.CodeMsg* 保持一致）
 	"不是好友":     4001,
 	"你已被对方拉黑":  4002,
-	"消息重复":     4003,
+	"消息正在发送中":  4003,
 	"不是该群组的成员": 5001,
 	"你已被禁言":    5002,
 	"无法撤回此消息":  1401,
+	"会话不存在":    1404,
 }
 
 // MapErrorCode 将 service 层返回的 error 字符串映射为前端错误码。

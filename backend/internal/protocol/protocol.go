@@ -7,16 +7,25 @@ import (
 )
 
 // 类型常量 — WebSocket 信封中所有可能的 "type" 值。
+//
+// 消息链路：
+//
+//	客户端 → 服务端：msg / readAck / convSyncReq / pullMsgs / revokeMsg
+//	服务端 → 客户端：serverAck / msg / convSync / pullMsgsResp / kick / error
+//
+// friendApply / friendAccepted / presence / ping / pong 仅保留常量，尚无业务实现；心跳使用 WebSocket 原生 Ping/Pong。
+//
+// 撤回不再有单独的推送类型：撤回通知是一条 msgType=6 的普通消息，占用会话 seq，
+// 客户端在 msg 或 pullMsgsResp 中收到后，按 content.targetSeq 把本地原消息标记为已撤回。
 const (
 	TypeMsg            = "msg"
 	TypeServerAck      = "serverAck"
-	TypeDeliverAck     = "deliverAck"
 	TypeReadAck        = "readAck"
-	TypeSyncReq        = "syncReq"
-	TypeSyncBatch      = "syncBatch"
+	TypeConvSyncReq    = "convSyncReq"
 	TypeConvSync       = "convSync"
+	TypePullMsgs       = "pullMsgs"
+	TypePullMsgsResp   = "pullMsgsResp"
 	TypeRevokeMsg      = "revokeMsg"
-	TypeMsgRevoked     = "msgRevoked"
 	TypeKick           = "kick"
 	TypeFriendApply    = "friendApply"
 	TypeFriendAccepted = "friendAccepted"

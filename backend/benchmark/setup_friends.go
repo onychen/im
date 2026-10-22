@@ -264,8 +264,9 @@ func warmFriendCache(uidA, uidB int64) error {
 
 	ctx := context.Background()
 	pipe := rdb.Pipeline()
-	pipe.Set(ctx, fmt.Sprintf("friend:%d:%d", uidA, uidB), "1", 0)
-	pipe.Set(ctx, fmt.Sprintf("friend:%d:%d", uidB, uidA), "1", 0)
+	// key 需与 repository.RelationCache 保持一致；不预热也能工作（首次发送回源 MySQL）。
+	pipe.Set(ctx, fmt.Sprintf("rel:friend:%d:%d", uidA, uidB), "1", time.Hour)
+	pipe.Set(ctx, fmt.Sprintf("rel:friend:%d:%d", uidB, uidA), "1", time.Hour)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}

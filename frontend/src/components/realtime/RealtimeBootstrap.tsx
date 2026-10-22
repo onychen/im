@@ -1,13 +1,19 @@
 import { useEffect } from "react";
-import type { ServerWsMessage } from "../../../goim-ws-types";
-import { buildPrivateConvId } from "../../../goim-ws-types";
+import type { PullMsgsReq, ServerWsMessage } from "../../../goim-ws-types";
+import { buildPrivateConvId, ConvType, MsgType, parseRevokeClientMsgId, privatePeerId } from "../../../goim-ws-types";
 import { useAuthStore } from "../../stores/authStore";
 import { useChatStore } from "../../stores/chatStore";
 import { goimSocket } from "../../realtime/socket";
 import { friendsApi, groupsApi, settingsApi } from "../../lib/api";
 import { configureNotifications, notifyIncomingMessage } from "../../realtime/notifications";
+import { createPullScheduler } from "../../realtime/pullScheduler";
 
 let loadedSettings: Awaited<ReturnType<typeof settingsApi.get>> | null = null;
+
+const pulls = createPullScheduler(
+  (request) => goimSocket.send({ type: "pullMsgs", data: request }),
+  (convId) => useChatStore.getState().conversations.find((item) => item.id === convId)?.syncedSeq ?? 0,
+);
 
 function applyMutedConversations() {
   if (!loadedSettings) return;
@@ -39,52 +45,63 @@ async function refreshPrivateConversationIdentities() {
   }
 }
 
+function requestPull(request: PullMsgsReq | null) {
+  pulls.request(request);
+}
+
+function requestConvSync() {
+  goimSocket.send({ type: "convSyncReq", data: {} });
+}
+
 function handleServerMessage(message: ServerWsMessage, currentUserId: number, clearSession: () => void) {
   const chat = useChatStore.getState();
   switch (message.type) {
     case "serverAck":
-      chat.acknowledge(message.data);
+      requestPull(chat.acknowledge(message.data));
       break;
-    case "msg":
-      if (message.data.fromId !== currentUserId) {
-        const conversation = chat.conversations.find((item) => item.id === message.data.convId);
-        notifyIncomingMessage({ convId: message.data.convId, title: conversation?.name ?? (message.data.convType === 2 ? "群聊新消息" : "好友新消息"), content: message.data.content });
+    case "msg": {
+      const data = message.data;
+      const isNotice = data.msgType === MsgType.Revoke;
+      const known = chat.conversations.some((item) => item.id === data.convId);
+      if (data.fromId !== currentUserId && !isNotice) {
+        const conversation = chat.conversations.find((item) => item.id === data.convId);
+        notifyIncomingMessage({ convId: data.convId, title: conversation?.name ?? (data.convType === ConvType.Group ? "群聊新消息" : "好友新消息"), content: data.content });
       }
-      chat.receiveMessage(message.data, currentUserId);
-      goimSocket.send({ type: "deliverAck", data: { serverMsgId: message.data.msgId } });
-      if (message.data.convType === 1) {
-        const targetId = message.data.fromId === currentUserId ? message.data.toId : message.data.fromId;
+      requestPull(chat.receiveMessage(data, currentUserId));
+      if (known) break;
+      // 首次出现的会话补齐名称与头像。
+      if (data.convType === ConvType.Private) {
+        const targetId = privatePeerId(data.convId, currentUserId);
         void friendsApi.list(100, 0).then((page) => {
           const friend = page.items.find((item) => item.friend_id === targetId);
-          if (friend) useChatStore.getState().setConversationIdentity(message.data.convId, friend.nickname || `用户 #${targetId}`, friend.avatar_url, friend.online);
+          if (friend) useChatStore.getState().setConversationIdentity(data.convId, friend.nickname || `用户 #${targetId}`, friend.avatar_url, friend.online);
         }).catch(() => undefined);
       } else {
-        void groupsApi.get(message.data.toId).then((group) => {
+        void groupsApi.get(Number(data.convId.slice(2))).then((group) => {
           useChatStore.getState().addGroupConversation(group.id, group.name);
         }).catch(() => undefined);
       }
       break;
-    case "syncBatch":
-      chat.applySyncBatch(message.data, currentUserId);
-      if (message.data.hasMore) {
-        const { lastSyncTime, lastSyncMsgId } = useChatStore.getState();
-        goimSocket.send({ type: "syncReq", data: { lastSyncTime, lastSyncMsgId, batchSize: 50 } });
-      }
-      break;
+    }
     case "convSync":
-      chat.applyConversationSync(message.data.conversations, message.data.unreadMap);
+      for (const request of chat.applyConvSync(message.data.conversations)) requestPull(request);
       applyMutedConversations();
       void refreshPrivateConversationIdentities();
       void groupsApi.list().then((groups) => {
         for (const group of groups) useChatStore.getState().addGroupConversation(group.id, group.name);
       }).catch(() => undefined);
       break;
-    case "msgRevoked":
-      chat.revokeMessage(message.data.convId, message.data.serverMsgId);
+    case "pullMsgsResp":
+      pulls.complete(message.data.convId, chat.applyPulledMsgs(message.data, currentUserId));
       break;
-    case "error":
-      chat.failLatestPending(message.data.message);
+    case "error": {
+      // 只有发送/撤回失败会带 clientMsgId；readAck、pullMsgs 等失败不影响消息状态。
+      const clientMsgId = message.data.clientMsgId;
+      if (!clientMsgId) break;
+      if (parseRevokeClientMsgId(clientMsgId)) chat.pushToast(`撤回失败：${message.data.message || "请稍后重试"}`, "error");
+      else chat.failMessage(clientMsgId, message.data.message);
       break;
+    }
     case "kick":
       goimSocket.disconnect();
       clearSession();
@@ -126,8 +143,10 @@ export function RealtimeBootstrap() {
       onStateChange: (state) => {
         useChatStore.getState().setConnectionState(state);
         if (state === "connected") {
-          const { lastSyncTime, lastSyncMsgId } = useChatStore.getState();
-          goimSocket.send({ type: "syncReq", data: { lastSyncTime, lastSyncMsgId, batchSize: 50 } });
+          // 上线与重连统一走 convSync：对比各会话 maxSeq 与本地 syncedSeq，再按区间 pullMsgs。
+          // 断线前在途的 pullMsgs 响应可能已丢失，先清空调度状态。
+          pulls.reset();
+          requestConvSync();
         }
       },
       onMessage: (message) => handleServerMessage(message, userId, clearSession),

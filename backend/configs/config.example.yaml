@@ -28,6 +28,11 @@ kafka:
   start_offset: "earliest"     # 新消费者组起始位置：earliest / latest
   commit_interval_ms: 1000     # offset 异步提交间隔；负数表示每条同步提交
 
+message:
+  node_id: 0                   # 雪花算法节点号（0-1023），单机部署保持 0
+  persist_batch_size: 200      # 消息落库消费者攒批阈值
+  persist_flush_ms: 100        # 消息落库消费者最大攒批间隔（毫秒）
+
 jwt:
   secret: "CHANGE-THIS-TO-A-STRONG-RANDOM-SECRET-32-CHARS-MIN"  # 生产环境中务必修改！
   access_exp_hours: 2     # 访问令牌有效期（小时）

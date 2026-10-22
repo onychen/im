@@ -25,10 +25,10 @@ import (
 	"github.com/goim/goim/internal/config"
 	"github.com/goim/goim/internal/conn"
 	"github.com/goim/goim/internal/consumer"
+	"github.com/goim/goim/internal/idgen"
 	"github.com/goim/goim/internal/infra"
 	"github.com/goim/goim/internal/middleware"
 	redislua "github.com/goim/goim/internal/redis"
-	"github.com/goim/goim/internal/relay"
 	"github.com/goim/goim/internal/repository"
 	"github.com/goim/goim/internal/service"
 	"github.com/goim/goim/internal/ws"
@@ -43,8 +43,9 @@ func main() {
 	}
 }
 
-// run keeps the dependency graph explicit: Redis is the message read/write
-// model, Kafka carries durable events, and MySQL archives them asynchronously.
+// run keeps the dependency graph explicit: Kafka (acks=all) is the commit
+// point for messages, MySQL is the source of truth written by the persist
+// consumer, and Redis only holds caches, seq counters and dedup keys.
 func run(configPath string) error {
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
@@ -100,22 +101,23 @@ func run(configPath string) error {
 
 	mysqlRepo := repository.NewMySQLRepo(db)
 	redisRepo := repository.NewRedisRepo(rdb)
+	msgCache := repository.NewMessageCache(rdb)
+	relations := repository.NewRelationCache(rdb, mysqlRepo)
 	mqWriter := kafkaClient.NewWriter()
 	defer mqWriter.Close()
 	mqRepo := repository.NewMQRepo(mqWriter)
 	cm := conn.NewConnectionManager()
-
-	var msgSvc *service.MsgService
-	if cfg.Message.AtomicPipeline {
-		msgSvc = service.NewMsgServiceWithMySQL(redisRepo, mqRepo, mysqlRepo, cm, logger)
-	} else {
-		msgSvc = service.NewMsgService(redisRepo, mqRepo, cm, logger)
+	ids, err := idgen.NewSnowflake(cfg.Message.NodeID)
+	if err != nil {
+		return fmt.Errorf("create snowflake: %w", err)
 	}
+
+	// mysqlRepo 同时实现 MySQLRepo（用户/好友/群组）与 MessageStore（消息/会话）。
+	msgSvc := service.NewMsgService(mysqlRepo, mysqlRepo, msgCache, relations, mqRepo, ids, cm, logger)
 	authSvc := service.NewAuthService(mysqlRepo, cfg.JWT.Secret, cfg.JWT.AccessExpHours, cfg.JWT.RefreshExpDays)
-	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger)
-	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger)
+	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations)
+	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations, msgSvc)
 	momentSvc := service.NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Duration(cfg.Moment.LikeCacheTTLHours)*time.Hour)
-	msgOpSvc := service.NewMsgOpService(mysqlRepo, redisRepo, logger)
 	settingsSvc := service.NewSettingsService(mysqlRepo, logger)
 	dispatcher := ws.NewMessageDispatcher(msgSvc, friendSvc)
 
@@ -125,35 +127,29 @@ func run(configPath string) error {
 	router := setupRouter(cfg, rdb, cm, dispatcher, kafkaReady,
 		api.NewAuthHandler(authSvc), api.NewFriendHandler(friendSvc, rdb),
 		api.NewGroupHandler(groupSvc, cm), api.NewMomentHandler(momentSvc),
-		api.NewMsgOpHandler(msgOpSvc), api.NewSettingsHandler(settingsSvc),
+		api.NewMsgOpHandler(msgSvc), api.NewConvHandler(msgSvc), api.NewSettingsHandler(settingsSvc),
 		api.NewUploadHandler(cfg.Server.UploadDir, cfg.File.MaxSizeMB, cfg.File.AllowedExts, mysqlRepo),
 		api.NewAvatarHandler())
 
-	// The atomic pipeline replaces the two legacy message consumers. The moment
-	// and like consumers remain active in either mode.
-	if cfg.Message.AtomicPipeline {
-		persistWriter := kafkaClient.NewWriter() // isolate relay latency from social events
-		defer persistWriter.Close()
-		messageRelay := relay.NewMessageRelay(redisRepo, repository.NewMQRepo(persistWriter), cm, logger)
-		if err := messageRelay.Start(ctx); err != nil {
-			return fmt.Errorf("start message relay: %w", err)
-		}
-		persistConsumer := consumer.NewMessagePersistConsumer(
-			kafkaClient.NewReader(infra.TopicMessagePersist, infra.GroupMessagePersist),
-			kafkaClient.NewReader(infra.TopicMessagePersistRetry, infra.GroupMessagePersistRetry),
-			mqWriter, mysqlRepo, logger)
-		if err := persistConsumer.Start(ctx); err != nil {
-			return fmt.Errorf("start message persistence consumer: %w", err)
-		}
-	} else {
-		privateConsumer := consumer.NewPrivateMsgConsumer(kafkaClient.NewReader(infra.TopicPrivateMsgPersist, infra.GroupPrivateMsg), mysqlRepo, redisRepo, cm, logger)
-		if err := privateConsumer.Start(ctx); err != nil {
-			return fmt.Errorf("start private message consumer: %w", err)
-		}
-		groupConsumer := consumer.NewGroupMsgConsumer(kafkaClient.NewReader(infra.TopicGroupMsgFanout, infra.GroupGroupMsg), mysqlRepo, redisRepo, cm, logger)
-		if err := groupConsumer.Start(ctx); err != nil {
-			return fmt.Errorf("start group message consumer: %w", err)
-		}
+	// msg_topic 上两个独立的消费者组：persist 负责落库，deliver 负责缓存与在线推送。
+	msgDLQ := consumer.DeadLetterPolicy{
+		MaxAttempts: consumer.DefaultDeadLetterAttempts,
+		Writer:      mqWriter,
+		Topic:       infra.TopicMsgDLQ,
+	}
+	persistConsumer := consumer.NewMsgPersistConsumer(
+		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgPersist),
+		mysqlRepo, logger, cfg.Message.PersistBatchSize, cfg.Message.PersistFlushMs,
+	).WithDeadLetter(msgDLQ)
+	if err := persistConsumer.Start(ctx); err != nil {
+		return fmt.Errorf("start message persist consumer: %w", err)
+	}
+	deliverConsumer := consumer.NewMsgDeliverConsumer(
+		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgDeliver),
+		msgSvc, logger,
+	).WithDeadLetter(msgDLQ)
+	if err := deliverConsumer.Start(ctx); err != nil {
+		return fmt.Errorf("start message deliver consumer: %w", err)
 	}
 	momentConsumer := consumer.NewMomentFeedConsumer(kafkaClient.NewReader(infra.TopicMomentPush, infra.GroupMomentFeed), mysqlRepo, redisRepo, logger, cfg.Moment.BigUserFriendThreshold, cfg.Moment.TimelineMaxLen)
 	if err := momentConsumer.Start(ctx); err != nil {
@@ -180,7 +176,7 @@ func run(configPath string) error {
 	server := &http.Server{Addr: fmt.Sprintf(":%d", cfg.Server.Port), Handler: router}
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.ListenAndServe() }()
-	logger.Info("GoIM server started", zap.Int("port", cfg.Server.Port), zap.Bool("atomicPipeline", cfg.Message.AtomicPipeline))
+	logger.Info("GoIM server started", zap.Int("port", cfg.Server.Port))
 	select {
 	case <-ctx.Done():
 	case err := <-serverErr:
@@ -196,7 +192,7 @@ func run(configPath string) error {
 
 func setupRouter(cfg *config.Config, rdb *redis.Client, cm *conn.ConnectionManager, dispatcher *ws.MessageDispatcher, kafkaReady func() bool,
 	authHandler *api.AuthHandler, friendHandler *api.FriendHandler, groupHandler *api.GroupHandler,
-	momentHandler *api.MomentHandler, msgOpHandler *api.MsgOpHandler, settingsHandler *api.SettingsHandler,
+	momentHandler *api.MomentHandler, msgOpHandler *api.MsgOpHandler, convHandler *api.ConvHandler, settingsHandler *api.SettingsHandler,
 	uploadHandler *api.UploadHandler, avatarHandler *api.AvatarHandler) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), middleware.CORS(nil))
@@ -217,6 +213,7 @@ func setupRouter(cfg *config.Config, rdb *redis.Client, cm *conn.ConnectionManag
 	groupHandler.RegisterRoutes(protected)
 	momentHandler.RegisterRoutes(protected)
 	msgOpHandler.RegisterRoutes(protected)
+	convHandler.RegisterRoutes(protected)
 	settingsHandler.RegisterRoutes(protected)
 	uploadHandler.RegisterRoutes(protected)
 	r.GET(cfg.Server.WsPath, ws.ServeWebSocket(cfg.JWT.Secret, rdb, cm, dispatcher.Callback()))

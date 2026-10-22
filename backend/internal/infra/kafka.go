@@ -15,48 +15,35 @@ import (
 )
 
 // ── Topic 名称 ──
-// 与原 RabbitMQ 队列一一对应，业务代码只需要替换投递目标，语义保持不变。
 const (
-	TopicMessagePersist      = "message_persist"
-	TopicMessagePersistRetry = "message_persist_retry" // 替代原 message_persist_delay（TTL + 死信回流）
-	TopicMessagePersistDLQ   = "message_persist_dlq"
-	TopicPrivateMsgPersist   = "private_msg_persist"
-	TopicGroupMsgFanout      = "group_msg_fanout"
-	TopicMomentPush          = "moment_push"
-	TopicLikePersist         = "like_persist"
-	TopicCommentPersist      = "comment_persist"
+	// TopicMsg 承载所有聊天消息（私聊、群聊、撤回通知），按 convId 分区保证同会话有序。
+	// 写入成功（acks=all）即为消息提交点；persist 与 deliver 两个消费者组各自独立消费。
+	TopicMsg         = "msg_topic"
+	TopicMomentPush  = "moment_push"
+	TopicLikePersist = "like_persist"
 
-	// 通用死信 Topic：对应消费者重试达到上限后转投，保留原消息与失败原因供人工排查/回放。
-	TopicPrivateMsgPersistDLQ = "private_msg_persist_dlq"
-	TopicGroupMsgFanoutDLQ    = "group_msg_fanout_dlq"
-	TopicMomentPushDLQ        = "moment_push_dlq"
-	TopicLikePersistDLQ       = "like_persist_dlq"
+	// 死信 Topic：消费者重试达到上限后转投，保留原消息与失败原因供人工排查/回放。
+	TopicMsgDLQ         = "msg_topic_dlq"
+	TopicMomentPushDLQ  = "moment_push_dlq"
+	TopicLikePersistDLQ = "like_persist_dlq"
 )
 
 // TopicNames 列出 IM 系统所需的所有 Topic。
 var TopicNames = []string{
-	TopicMessagePersist,
-	TopicMessagePersistRetry,
-	TopicMessagePersistDLQ,
-	TopicPrivateMsgPersist,
-	TopicGroupMsgFanout,
+	TopicMsg,
 	TopicMomentPush,
 	TopicLikePersist,
-	TopicCommentPersist,
-	TopicPrivateMsgPersistDLQ,
-	TopicGroupMsgFanoutDLQ,
+	TopicMsgDLQ,
 	TopicMomentPushDLQ,
 	TopicLikePersistDLQ,
 }
 
 // ── 消费者组名称（会拼接 config.Kafka.GroupPrefix）──
 const (
-	GroupMessagePersist      = "message-persist"
-	GroupMessagePersistRetry = "message-persist-retry"
-	GroupPrivateMsg          = "private-msg"
-	GroupGroupMsg            = "group-msg"
-	GroupMomentFeed          = "moment-feed"
-	GroupLikePersist         = "like-persist"
+	GroupMsgPersist   = "msg-persist"
+	GroupMsgDeliver   = "msg-deliver"
+	GroupMomentFeed   = "moment-feed"
+	GroupLikePersist  = "like-persist"
 )
 
 // KafkaClient 封装 broker 地址与 Dialer，负责创建 Writer / Reader 以及运维类操作。
@@ -204,7 +191,7 @@ func ConnectKafkaWithRetry(
 
 // NewWriter 创建一个同步、强确认的 Writer：
 //   - RequiredAcks=RequireAll 等价于 RabbitMQ publisher confirm，WriteMessages 返回 nil
-//     即代表 ISR 全部落盘，可作为 relay 的可靠性边界。
+//     即代表 ISR 全部落盘，可作为消息提交点。
 //   - Topic 留空，由每条 Message 自行指定，便于一个 Writer 服务多个 Topic。
 //   - Balancer 使用 Hash，按 Key 路由分区，保证同一会话/同一动态的事件有序。
 //   - BatchTimeout 必须调小，kafka-go 默认 1s，同步写会被白白拖慢。

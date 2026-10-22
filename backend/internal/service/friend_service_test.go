@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -12,7 +11,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/goim/goim/internal/model"
-	redislua "github.com/goim/goim/internal/redis"
 )
 
 // ──────────────────────────────────────────────────────
@@ -257,13 +255,6 @@ func (m *mockFriendRepo) DeleteMoment(_ context.Context, _ int64) error     { re
 
 // ── 桩实现：其他所有 MySQLRepo 方法 ──
 
-func (m *mockFriendRepo) InsertPrivateMessage(_ context.Context, _ *model.PrivateMessage) error {
-	return nil
-}
-func (m *mockFriendRepo) InsertGroupMessage(_ context.Context, _ *model.GroupMessage) error {
-	return nil
-}
-func (m *mockFriendRepo) InsertMsgRevoked(_ context.Context, _ *model.MsgRevoked) error { return nil }
 
 func (m *mockFriendRepo) CreateGroup(_ context.Context, _ *model.Group) (int64, error) { return 0, nil }
 func (m *mockFriendRepo) UpdateGroup(_ context.Context, _ *model.Group) error          { return nil }
@@ -320,9 +311,6 @@ func (m *mockFriendRepo) GetUserSettings(_ context.Context, _ int64) (*model.Use
 func (m *mockFriendRepo) CreateOrUpdateUserSettings(_ context.Context, _ *model.UserSettings) error {
 	return nil
 }
-func (m *mockFriendRepo) SearchPrivateMessages(_ context.Context, _ int64, _ string, _ int, _ int) ([]model.PrivateMessage, error) {
-	return nil, nil
-}
 
 // ──────────────────────────────────────────────────────
 // 模拟 RedisRepo，用于好友相关测试
@@ -335,85 +323,10 @@ type friendMomentFanout struct {
 }
 
 type mockFriendRedisRepo struct {
-	momentFanouts       []friendMomentFanout
-	convUpdates         []friendConvUpdate
-	deletedFriendCaches [][2]int64
+	momentFanouts []friendMomentFanout
 }
 
-type friendConvUpdate struct {
-	userID, timestamp int64
-	convID, summary   string
-}
-
-func (m *mockFriendRedisRepo) WriteInbox(_ context.Context, _ int64, _ *model.InboxMessage) error {
-	return nil
-}
-func (m *mockFriendRedisRepo) WriteOutbox(_ context.Context, _ int64, _ *model.InboxMessage) error {
-	return nil
-}
-func (m *mockFriendRedisRepo) ReadInbox(_ context.Context, _ int64, _, _ int64, _ int) ([]model.InboxMessage, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) ReadOutbox(_ context.Context, _ int64, _, _ int64, _ int) ([]model.InboxMessage, error) {
-	return nil, nil
-}
-
-func (m *mockFriendRedisRepo) UpdateConvList(_ context.Context, userID int64, convID, summary string, timestamp int64) error {
-	m.convUpdates = append(m.convUpdates, friendConvUpdate{userID: userID, convID: convID, summary: summary, timestamp: timestamp})
-	return nil
-}
-func (m *mockFriendRedisRepo) GetConvList(_ context.Context, _ int64) ([]model.ConvSummary, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) IncrementUnread(_ context.Context, _ int64, _ string) error { return nil }
-func (m *mockFriendRedisRepo) ClearUnread(_ context.Context, _ int64, _ string) error     { return nil }
-func (m *mockFriendRedisRepo) GetUnreadMap(_ context.Context, _ int64) (map[string]int64, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) SetGroupReadPos(_ context.Context, _ int64, _ string, _ int64) error {
-	return nil
-}
-func (m *mockFriendRedisRepo) GetGroupReadPos(_ context.Context, _ int64, _ string) (int64, error) {
-	return 0, nil
-}
-
-func (m *mockFriendRedisRepo) GetGroupSeq(_ context.Context, _ int64) (int64, error) { return 0, nil }
-func (m *mockFriendRedisRepo) GetGroupMemberships(_ context.Context, _ int64) ([]int64, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) GetGroupMembers(_ context.Context, _ int64) ([]int64, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) CheckDuplicate(_ context.Context, _ int64, _ string) (bool, error) {
-	return false, nil
-}
-func (m *mockFriendRedisRepo) TrimInbox(_ context.Context, _ int64, _ int) error          { return nil }
-func (m *mockFriendRedisRepo) TrimOutbox(_ context.Context, _ int64, _ int) error         { return nil }
-func (m *mockFriendRedisRepo) TrimInboxByTime(_ context.Context, _ int64, _ int64) error  { return nil }
-func (m *mockFriendRedisRepo) TrimOutboxByTime(_ context.Context, _ int64, _ int64) error { return nil }
-func (m *mockFriendRedisRepo) TrimConvListByTime(_ context.Context, _ int64, _ int64) error {
-	return nil
-}
 func (m *mockFriendRedisRepo) TrimTimelineByTime(_ context.Context, _ int64, _ int64) error {
-	return nil
-}
-
-func (m *mockFriendRedisRepo) ExecPrivateMsgCheck(_ context.Context, _ int64, _ int64, _ string) (*redislua.PrivateMsgCheckResult, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) ExecGroupMsgCheck(_ context.Context, _ int64, _ int64, _ string) (*redislua.GroupMsgCheckResult, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) ExecInboxMarkRead(_ context.Context, _ int64, _ string) (int64, error) {
-	return 0, nil
-}
-func (m *mockFriendRedisRepo) ExecRevokeMsg(_ context.Context, _ int64, _ string, _ int64, _ string, _ int64) (bool, error) {
-	return false, nil
-}
-func (m *mockFriendRedisRepo) AddGroupMemberRedis(_ context.Context, _ int64, _ int64) error {
-	return nil
-}
-func (m *mockFriendRedisRepo) RemoveGroupMemberRedis(_ context.Context, _ int64, _ int64) error {
 	return nil
 }
 func (m *mockFriendRedisRepo) PublishMomentFeed(_ context.Context, _ int64, _ int64, _ int64) error {
@@ -440,11 +353,6 @@ func (m *mockFriendRedisRepo) GetTimelinePage(_ context.Context, _ int64, _ int6
 }
 func (m *mockFriendRedisRepo) GetOutboxPage(_ context.Context, _ int64, _ int64, _ int64, _ int) ([]model.FeedEntry, error) {
 	return nil, nil
-}
-func (m *mockFriendRedisRepo) SetFriendCache(_ context.Context, _ int64, _ int64) error { return nil }
-func (m *mockFriendRedisRepo) DeleteFriendCache(_ context.Context, uidA, uidB int64) error {
-	m.deletedFriendCaches = append(m.deletedFriendCaches, [2]int64{uidA, uidB})
-	return nil
 }
 
 // ──────────────────────────────────────────────────────
@@ -624,38 +532,32 @@ func TestFriend_AcceptFriendRequest_Success(t *testing.T) {
 	assert.True(t, isFriend)
 }
 
-func TestFriend_AcceptFriendRequest_CreatesEmptyConversationForBothUsers(t *testing.T) {
+func TestFriend_AcceptFriendRequest_CreatesConversationForBothUsers(t *testing.T) {
 	repo := newMockFriendRepo()
-	repo.users[1] = &model.User{ID: 1, Username: "alice", AvatarURL: "/alice.png"}
-	repo.users[2] = &model.User{ID: 2, Username: "bob", AvatarURL: "/bob.png"}
-	redisRepo := &mockFriendRedisRepo{}
-	svc := newTestFriendServiceWithRedis(repo, redisRepo)
+	store := newRecordingMessageStore()
+	relations := &recordingRelations{}
+	svc := newTestFriendService(repo).WithMessaging(store, relations)
 
 	req, err := svc.SendFriendRequest(context.Background(), 1, 2, "hello")
 	assert.NoError(t, err)
 	_, err = svc.AcceptFriendRequest(context.Background(), 2, req.ID)
 	assert.NoError(t, err)
 
-	if assert.Len(t, redisRepo.convUpdates, 2) {
-		for _, update := range redisRepo.convUpdates {
-			assert.Equal(t, "p_1_2", update.convID)
-			var summary model.ConvSummary
-			assert.NoError(t, json.Unmarshal([]byte(update.summary), &summary))
-			assert.Equal(t, model.ConvTypePrivate, summary.ConvType)
-			assert.NotZero(t, summary.TargetID)
-		}
-	}
+	convID := model.BuildConvID(model.ConvTypePrivate, 1, 2)
+	assert.Equal(t, model.ConvTypePrivate, store.ensuredConvs[convID])
+	assert.ElementsMatch(t, []int64{1, 2}, store.userConvs[convID])
+	assert.NotEmpty(t, relations.friendInvalidations)
 }
 
-func TestFriend_DeleteFriend_RemovesPrivateMessageAuthorizationCache(t *testing.T) {
+func TestFriend_DeleteFriend_InvalidatesFriendCache(t *testing.T) {
 	repo := newMockFriendRepo()
 	repo.friendships[friendKey(1, 2)] = &model.Friendship{UserID: 1, FriendID: 2}
 	repo.friendships[friendKey(2, 1)] = &model.Friendship{UserID: 2, FriendID: 1}
-	redisRepo := &mockFriendRedisRepo{}
-	svc := newTestFriendServiceWithRedis(repo, redisRepo)
+	relations := &recordingRelations{}
+	svc := newTestFriendService(repo).WithMessaging(nil, relations)
 
 	assert.NoError(t, svc.DeleteFriend(context.Background(), 1, 2))
-	assert.Equal(t, [][2]int64{{1, 2}}, redisRepo.deletedFriendCaches)
+	assert.Equal(t, [][2]int64{{1, 2}}, relations.friendInvalidations)
 }
 
 func TestFriend_AcceptFriendRequest_BackfillsVisibleMoments(t *testing.T) {

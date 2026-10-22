@@ -8,17 +8,16 @@ import (
 	"github.com/goim/goim/internal/protocol"
 )
 
-// 在 ws 包内重新导出 Type 常量以保持向后兼容。
+// 在 ws 包内重新导出 Type 常量。
 const (
 	TypeMsg            = protocol.TypeMsg
 	TypeServerAck      = protocol.TypeServerAck
-	TypeDeliverAck     = protocol.TypeDeliverAck
 	TypeReadAck        = protocol.TypeReadAck
-	TypeSyncReq        = protocol.TypeSyncReq
-	TypeSyncBatch      = protocol.TypeSyncBatch
+	TypeConvSyncReq    = protocol.TypeConvSyncReq
 	TypeConvSync       = protocol.TypeConvSync
+	TypePullMsgs       = protocol.TypePullMsgs
+	TypePullMsgsResp   = protocol.TypePullMsgsResp
 	TypeRevokeMsg      = protocol.TypeRevokeMsg
-	TypeMsgRevoked     = protocol.TypeMsgRevoked
 	TypeKick           = protocol.TypeKick
 	TypeFriendApply    = protocol.TypeFriendApply
 	TypeFriendAccepted = protocol.TypeFriendAccepted

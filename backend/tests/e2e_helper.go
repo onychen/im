@@ -67,9 +67,36 @@ type wsEnvelope struct {
 
 type serverAckData struct {
 	ClientMsgID string `json:"clientMsgId"`
-	ServerMsgID int64  `json:"serverMsgId"`
-	GroupSeq    int64  `json:"groupSeq,omitempty"`
+	ServerMsgID int64  `json:"serverMsgId,string"`
+	ConvID      string `json:"convId"`
+	Seq         int64  `json:"seq"`
 	Timestamp   int64  `json:"timestamp"`
+}
+
+// wsMsgData 是服务端推送的 msg 帧 / pullMsgsResp 中的单条消息。
+type wsMsgData struct {
+	ConvID   string `json:"convId"`
+	Seq      int64  `json:"seq"`
+	MsgID    int64  `json:"msgId,string"`
+	SenderID int64  `json:"fromId"`
+	MsgType  int    `json:"msgType"`
+	Content  string `json:"content"`
+	Status   int    `json:"status"`
+}
+
+type convViewData struct {
+	ConvID  string `json:"convId"`
+	MaxSeq  int64  `json:"maxSeq"`
+	ReadSeq int64  `json:"readSeq"`
+	Unread  int64  `json:"unread"`
+}
+
+type pullMsgsRespData struct {
+	ConvID    string      `json:"convId"`
+	ToSeq     int64       `json:"toSeq"`
+	Watermark int64       `json:"watermark"`
+	Msgs      []wsMsgData `json:"msgs"`
+	HasMore   bool        `json:"hasMore"`
 }
 
 type sendMsgData struct {

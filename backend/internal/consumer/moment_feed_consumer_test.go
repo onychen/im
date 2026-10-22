@@ -45,15 +45,6 @@ func (m *momentConsumerMySQLMock) GetFriendList(_ context.Context, userID int64)
 
 // ── 其余接口方法（消费者未使用，未实现）──
 
-func (m *momentConsumerMySQLMock) InsertPrivateMessage(context.Context, *model.PrivateMessage) error {
-	panic("未实现")
-}
-func (m *momentConsumerMySQLMock) InsertGroupMessage(context.Context, *model.GroupMessage) error {
-	panic("未实现")
-}
-func (m *momentConsumerMySQLMock) InsertMsgRevoked(context.Context, *model.MsgRevoked) error {
-	panic("未实现")
-}
 func (m *momentConsumerMySQLMock) GetUserByID(context.Context, int64) (*model.User, error) {
 	panic("未实现")
 }
@@ -157,9 +148,6 @@ func (m *momentConsumerMySQLMock) GetUserSettings(context.Context, int64) (*mode
 	panic("未实现")
 }
 func (m *momentConsumerMySQLMock) CreateOrUpdateUserSettings(context.Context, *model.UserSettings) error {
-	panic("未实现")
-}
-func (m *momentConsumerMySQLMock) SearchPrivateMessages(context.Context, int64, string, int, int) ([]model.PrivateMessage, error) {
 	panic("未实现")
 }
 

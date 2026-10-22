@@ -22,6 +22,11 @@ kafka:
   partitions: 1
   replication_factor: 1
 
+message:
+  node_id: 1
+  persist_batch_size: 50
+  persist_flush_ms: 50
+
 jwt:
   secret: "test-secret"
   access_exp_hours: 1

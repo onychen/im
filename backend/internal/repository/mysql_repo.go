@@ -12,11 +12,6 @@ import (
 // MySQLRepo 定义了服务和消费者所需的所有 MySQL CRUD 操作。
 // 该接口允许在测试中进行模拟。方法将在任务 12-17 中逐步完善。
 type MySQLRepo interface {
-	// ── 消息 ──
-	InsertPrivateMessage(ctx context.Context, msg *model.PrivateMessage) error
-	InsertGroupMessage(ctx context.Context, msg *model.GroupMessage) error
-	InsertMsgRevoked(ctx context.Context, revoked *model.MsgRevoked) error
-
 	// ── 用户 ──
 	GetUserByID(ctx context.Context, userID int64) (*model.User, error)
 	GetUserByUsername(ctx context.Context, username string) (*model.User, error)
@@ -64,9 +59,6 @@ type MySQLRepo interface {
 	// ── 用户设置 ──
 	GetUserSettings(ctx context.Context, userID int64) (*model.UserSettings, error)
 	CreateOrUpdateUserSettings(ctx context.Context, settings *model.UserSettings) error
-
-	// ── 消息搜索 ──
-	SearchPrivateMessages(ctx context.Context, userID int64, query string, limit, offset int) ([]model.PrivateMessage, error)
 }
 
 // ──────────────────────────────────────────────────────
@@ -79,95 +71,6 @@ type MySQLRepoImpl struct {
 
 func NewMySQLRepo(db *sql.DB) *MySQLRepoImpl {
 	return &MySQLRepoImpl{db: db}
-}
-
-// ── 消息 ──
-
-func (m *MySQLRepoImpl) InsertPrivateMessage(ctx context.Context, msg *model.PrivateMessage) error {
-	query := `INSERT INTO private_messages (id, client_msg_id, sender_id, receiver_id, content, msg_type, created_at)
-	          VALUES (?, ?, ?, ?, ?, ?, ?)
-	          ON DUPLICATE KEY UPDATE id = id`
-	result, err := m.db.ExecContext(ctx, query,
-		msg.ID,
-		msg.ClientMsgID,
-		msg.SenderID,
-		msg.ReceiverID,
-		msg.Content,
-		msg.MsgType,
-		msg.CreatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("插入 private_messages: %w", err)
-	}
-	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
-		var stored model.PrivateMessage
-		var clientID sql.NullString
-		err := m.db.QueryRowContext(ctx, `SELECT client_msg_id, sender_id, receiver_id, content, msg_type FROM private_messages WHERE id = ?`, msg.ID).Scan(&clientID, &stored.SenderID, &stored.ReceiverID, &stored.Content, &stored.MsgType)
-		if err != nil {
-			return fmt.Errorf("verify duplicate private message: %w", err)
-		}
-		if clientID.Valid {
-			stored.ClientMsgID = clientID.String
-		}
-		if stored.ClientMsgID != msg.ClientMsgID || stored.SenderID != msg.SenderID || stored.ReceiverID != msg.ReceiverID || stored.Content != msg.Content || stored.MsgType != msg.MsgType {
-			return fmt.Errorf("private message id %d conflicts with existing content", msg.ID)
-		}
-	}
-	return nil
-}
-
-func (m *MySQLRepoImpl) InsertGroupMessage(ctx context.Context, msg *model.GroupMessage) error {
-	query := `INSERT INTO group_messages (id, client_msg_id, group_id, sender_id, content, msg_type, group_seq, created_at)
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	          ON DUPLICATE KEY UPDATE id = id`
-	result, err := m.db.ExecContext(ctx, query,
-		msg.ID,
-		msg.ClientMsgID,
-		msg.GroupID,
-		msg.SenderID,
-		msg.Content,
-		msg.MsgType,
-		msg.GroupSeq,
-		msg.CreatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("插入 group_messages: %w", err)
-	}
-	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
-		var stored model.GroupMessage
-		var clientID sql.NullString
-		err := m.db.QueryRowContext(ctx, `SELECT client_msg_id, group_id, sender_id, content, msg_type, group_seq FROM group_messages WHERE id = ?`, msg.ID).Scan(&clientID, &stored.GroupID, &stored.SenderID, &stored.Content, &stored.MsgType, &stored.GroupSeq)
-		if err != nil {
-			return fmt.Errorf("verify duplicate group message: %w", err)
-		}
-		if clientID.Valid {
-			stored.ClientMsgID = clientID.String
-		}
-		if stored.ClientMsgID != msg.ClientMsgID || stored.GroupID != msg.GroupID || stored.SenderID != msg.SenderID || stored.Content != msg.Content || stored.MsgType != msg.MsgType || stored.GroupSeq != msg.GroupSeq {
-			return fmt.Errorf("group message id %d conflicts with existing content", msg.ID)
-		}
-	}
-	return nil
-}
-
-func (m *MySQLRepoImpl) InsertMsgRevoked(ctx context.Context, revoked *model.MsgRevoked) error {
-	query := `INSERT INTO msg_revoked (msg_id, conv_id, operator_id, revoked_at)
-	          VALUES (?, ?, ?, ?)`
-	result, err := m.db.ExecContext(ctx, query,
-		revoked.MsgID,
-		revoked.ConvID,
-		revoked.OperatorID,
-		revoked.RevokedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("插入 msg_revoked: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("获取 msg_revoked 最后插入ID: %w", err)
-	}
-	revoked.ID = id
-	return nil
 }
 
 // ── 用户（在任务 12 中完善） ──
@@ -797,32 +700,4 @@ func (m *MySQLRepoImpl) CreateOrUpdateUserSettings(ctx context.Context, settings
 	}
 	settings.ID = id
 	return nil
-}
-
-// ── 消息搜索（在任务 17 中完善） ──
-
-func (m *MySQLRepoImpl) SearchPrivateMessages(ctx context.Context, userID int64, query string, limit, offset int) ([]model.PrivateMessage, error) {
-	sqlQuery := `SELECT id, sender_id, receiver_id, content, msg_type, created_at
-	             FROM private_messages
-	             WHERE (sender_id = ? OR receiver_id = ?) AND content LIKE ?
-	             ORDER BY created_at DESC LIMIT ? OFFSET ?`
-	likeQuery := "%" + query + "%"
-	rows, err := m.db.QueryContext(ctx, sqlQuery, userID, userID, likeQuery, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("搜索私聊消息: %w", err)
-	}
-	defer rows.Close()
-
-	var results []model.PrivateMessage
-	for rows.Next() {
-		var msg model.PrivateMessage
-		if err := rows.Scan(&msg.ID, &msg.SenderID, &msg.ReceiverID, &msg.Content, &msg.MsgType, &msg.CreatedAt); err != nil {
-			return nil, fmt.Errorf("扫描私聊消息: %w", err)
-		}
-		results = append(results, msg)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历私聊消息: %w", err)
-	}
-	return results, nil
 }

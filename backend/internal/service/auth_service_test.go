@@ -99,11 +99,6 @@ func (m *mockAuthRepo) UpdateUser(_ context.Context, user *model.User) error {
 }
 func (m *mockAuthRepo) DeleteMoment(_ context.Context, _ int64) error { return nil }
 
-func (m *mockAuthRepo) InsertPrivateMessage(_ context.Context, _ *model.PrivateMessage) error {
-	return nil
-}
-func (m *mockAuthRepo) InsertGroupMessage(_ context.Context, _ *model.GroupMessage) error { return nil }
-func (m *mockAuthRepo) InsertMsgRevoked(_ context.Context, _ *model.MsgRevoked) error     { return nil }
 
 func (m *mockAuthRepo) CreateFriendRequest(_ context.Context, _ *model.FriendRequest) error {
 	return nil
@@ -172,9 +167,6 @@ func (m *mockAuthRepo) GetUserSettings(_ context.Context, _ int64) (*model.UserS
 }
 func (m *mockAuthRepo) CreateOrUpdateUserSettings(_ context.Context, _ *model.UserSettings) error {
 	return nil
-}
-func (m *mockAuthRepo) SearchPrivateMessages(_ context.Context, _ int64, _ string, _ int, _ int) ([]model.PrivateMessage, error) {
-	return nil, nil
 }
 
 // ──────────────────────────────────────────────────────

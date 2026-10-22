@@ -1,8 +1,12 @@
 // ============================================================================
 // GoIM WebSocket 协议 TypeScript 类型定义
 // ============================================================================
-// 基于 GoIM v1.0 WebSocket 协议
-// 直接复制此文件到前端项目即可获得完整的 WS 消息类型安全
+// 会话模型：每个会话（私聊 p_{小}_{大} / 群聊 g_{gid}）维护单调递增的 seq。
+// 客户端以 convId + seq 唯一定位消息：
+//   - 上线/重连发送 convSyncReq，服务端返回全部会话的 maxSeq/readSeq/unread；
+//   - 本地 seq 落后时发送 pullMsgs 按区间补拉；
+//   - 已读上报 readAck { convId, seq }；
+//   - 撤回以 msgType=6 的通知消息下发，content 为 RevokeNotice JSON。
 // ============================================================================
 
 // ──────────────────────────────────────────────────────
@@ -15,7 +19,13 @@ export enum MsgType {
   Image   = 2,  // 图片消息
   Video   = 3,  // 视频消息
   System  = 5,  // 系统通知
-  Revoked = 6,  // 撤回占位符
+  Revoke  = 6,  // 撤回通知（content 为 RevokeNotice JSON）
+}
+
+/** 消息状态 */
+export enum MsgStatus {
+  Normal  = 0,
+  Revoked = 1,
 }
 
 /** 会话类型 */
@@ -40,114 +50,122 @@ export enum MomentVisibility {
 /** WS 消息 type 字段 — 客户端→服务端 */
 export const ClientMsgType = {
   Msg:         "msg",
-  DeliverAck:  "deliverAck",
   ReadAck:     "readAck",
-  SyncReq:     "syncReq",
+  ConvSyncReq: "convSyncReq",
+  PullMsgs:    "pullMsgs",
   RevokeMsg:   "revokeMsg",
 } as const;
 
 /** WS 消息 type 字段 — 服务端→客户端 */
 export const ServerMsgType = {
-  Msg:            "msg",
-  ServerAck:      "serverAck",
-  SyncBatch:      "syncBatch",
-  ConvSync:       "convSync",
-  MsgRevoked:     "msgRevoked",
-  Kick:           "kick",
-  Error:          "error",
+  Msg:          "msg",
+  ServerAck:    "serverAck",
+  ConvSync:     "convSync",
+  PullMsgsResp: "pullMsgsResp",
+  Kick:         "kick",
+  Error:        "error",
 } as const;
+
+/** 撤回请求在 serverAck / error 中使用的 clientMsgId 前缀：revoke:{convId}:{seq} */
+export const RevokeClientMsgPrefix = "revoke:";
 
 // ──────────────────────────────────────────────────────
 // 数据载荷类型
 // ──────────────────────────────────────────────────────
 
-/** 收件箱/发件箱中的消息 */
-export interface InboxMessage {
-  msgId:      number;
-  convId:     string;
-  convType:   ConvType;
-  fromId:     number;
-  toId:       number;
-  msgType:    MsgType;
-  content:    string;
-  readStatus: number;   // 0=未读, 1=已读 (仅私聊)
-  groupSeq?:  number;   // 群消息序号 (仅群聊)
-  timestamp:  number;   // Unix 毫秒时间戳
+/** 会话内的一条消息（推送 / 补拉 / 历史共用） */
+export interface WsMessage {
+  convId:       string;
+  seq:          number;   // 会话内单调递增序号
+  msgId:        string;   // 服务端雪花 ID，全局唯一；JSON 中为字符串，避免超过 JS 安全整数丢精度
+  convType:     ConvType;
+  fromId:       number;
+  msgType:      MsgType;
+  content:      string;
+  status:       MsgStatus;
+  clientMsgId?: string;
+  timestamp:    number;   // 服务端时间，Unix 毫秒
+}
+
+/** 撤回通知内容（msgType=6 消息的 content 解析结果） */
+export interface RevokeNotice {
+  targetSeq:   number;
+  targetMsgId: string;
+  operatorId:  number;
 }
 
 /** 客户端发送的聊天消息 */
 export interface SendMessage {
-  msgId:     string;    // 客户端生成的唯一ID，用于去重
+  msgId:     string;    // 客户端生成的唯一ID（clientMsgId），用于幂等
   convType:  ConvType;
   toId:      number;    // 接收者ID(私聊) 或 群组ID(群聊)
   msgType:   MsgType;
   content:   string;
-  timestamp: number;
+  timestamp?: number;   // 仅客户端本地展示用，服务端以自身时间为准
 }
 
-/** 服务端回执 */
+/** 服务端回执：消息已写入 Kafka，seq 已分配 */
 export interface ServerAck {
   clientMsgId: string;
-  serverMsgId: number;
-  groupSeq?:   number;   // 群聊时返回
+  serverMsgId: string;  // 雪花 ID 字符串
+  convId:      string;
+  seq:         number;
   timestamp:   number;
 }
 
-/** 送达确认 */
-export interface DeliverAck {
-  serverMsgId: number;
-}
-
-/** 已读确认 */
+/** 已读上报：把已读位置推进到 seq（只前进不回退） */
 export interface ReadAck {
   convId: string;
-  /** 群聊已读水位线：已展示的最后一条群消息序号（私聊忽略，可选；缺省时服务端标记到最新） */
-  lastReadGroupSeq?: number;
+  seq:    number;
 }
 
-/** 离线同步请求 */
-export interface SyncReq {
-  lastSyncTime:   number;
-  lastSyncMsgId?: number;
-  batchSize:      number;
-}
-
-/** 离线同步批次 */
-export interface SyncBatch {
-  msgs:       InboxMessage[];
-  hasMore:    boolean;
-  syncTime:   number;
-  syncMsgId?: number;
-}
-
-/** 会话摘要 */
-export interface ConvSummary {
+/** 会话视图 */
+export interface ConvView {
   convId:       string;
   convType:     ConvType;
   targetId:     number;
   targetName:   string;
   targetAvatar: string;
-  lastMsg:      string;
+  maxSeq:       number;
+  readSeq:      number;
+  minSeq:       number;
+  unread:       number;
+  lastMsg?:     WsMessage;
+  lastMsgBrief: string;
   lastMsgTime:  number;
+  pinned:       boolean;
+  muted:        boolean;
 }
 
 /** 会话同步 */
 export interface ConvSync {
-  conversations: ConvSummary[];
-  unreadMap:     Record<string, number>;
+  conversations: ConvView[];
+}
+
+/** 按 seq 区间补拉；toSeq<=0 表示拉到最新 */
+export interface PullMsgsReq {
+  convId:  string;
+  fromSeq: number;
+  toSeq:   number;
+}
+
+/**
+ * 补拉结果；hasMore=true 时从 toSeq+1 继续。
+ * watermark 为服务端已投递水位：toSeq 不会超过它，水位以下仍缺失的 seq 是空洞（Kafka 写失败），无需再拉。
+ */
+export interface PullMsgsResp {
+  convId:    string;
+  fromSeq:   number;
+  toSeq:     number;
+  watermark: number;
+  msgs:      WsMessage[];
+  hasMore:   boolean;
 }
 
 /** 撤回消息请求 */
 export interface RevokeMsgReq {
-  convId:      string;
-  serverMsgId: number;
-}
-
-/** 撤回通知 */
-export interface RevokedNotification {
-  convId:      string;
-  serverMsgId: number;
-  operatorId:  number;
+  convId: string;
+  seq:    number;
 }
 
 /** 被踢出通知 */
@@ -165,14 +183,11 @@ export interface GroupAddedNotification {
   name: string;
 }
 
-/** 好友申请 (通过WS) */
-
-/** 好友申请被接受通知 */
-
-/** 错误通知 */
+/** 错误通知；发送/撤回失败时带 clientMsgId */
 export interface WsError {
-  code:    number;
-  message: string;
+  code:         number;
+  message:      string;
+  clientMsgId?: string;
 }
 
 // ──────────────────────────────────────────────────────
@@ -180,30 +195,29 @@ export interface WsError {
 // ──────────────────────────────────────────────────────
 
 export type ClientWsMessage =
-  | { type: "msg";          data: SendMessage }
-  | { type: "deliverAck";   data: DeliverAck }
-  | { type: "readAck";      data: ReadAck }
-  | { type: "syncReq";      data: SyncReq }
-  | { type: "revokeMsg";    data: RevokeMsgReq };
+  | { type: "msg";         data: SendMessage }
+  | { type: "readAck";     data: ReadAck }
+  | { type: "convSyncReq"; data?: Record<string, never> }
+  | { type: "pullMsgs";    data: PullMsgsReq }
+  | { type: "revokeMsg";   data: RevokeMsgReq };
 
 // ──────────────────────────────────────────────────────
 // 联合类型：服务端 → 客户端
 // ──────────────────────────────────────────────────────
 
 export type ServerWsMessage =
-  | { type: "msg";            data: InboxMessage }
-  | { type: "serverAck";      data: ServerAck }
-  | { type: "syncBatch";      data: SyncBatch }
-  | { type: "convSync";       data: ConvSync }
-  | { type: "msgRevoked";     data: RevokedNotification }
+  | { type: "msg";          data: WsMessage }
+  | { type: "serverAck";    data: ServerAck }
+  | { type: "convSync";     data: ConvSync }
+  | { type: "pullMsgsResp"; data: PullMsgsResp }
   // `kick` is emitted by the connection manager without a `data` envelope.
-  | { type: "kick";           reason: KickNotification["reason"] }
-    | { type: "groupRemoved";   data: GroupRemovedNotification }
-    | { type: "groupAdded";     data: GroupAddedNotification }
-  | { type: "error";          data: WsError };
+  | { type: "kick";         reason: KickNotification["reason"] }
+  | { type: "groupRemoved"; data: GroupRemovedNotification }
+  | { type: "groupAdded";   data: GroupAddedNotification }
+  | { type: "error";        data: WsError };
 
 // ──────────────────────────────────────────────────────
-// 会话 ID 构建辅助函数
+// 辅助函数
 // ──────────────────────────────────────────────────────
 
 /** 构建私聊会话ID: p_{较小ID}_{较大ID} */
@@ -217,7 +231,7 @@ export function buildGroupConvId(groupId: number): string {
   return `g_${groupId}`;
 }
 
-/** 从会话ID解析类型 */
+/** 从会话ID解析类型；私聊返回较小的用户ID，需要对端ID请用 privatePeerId */
 export function parseConvId(convId: string): { type: ConvType; id: number } | null {
   if (convId.startsWith("p_")) {
     return { type: ConvType.Private, id: Number(convId.split("_")[1]) };
@@ -226,6 +240,36 @@ export function parseConvId(convId: string): { type: ConvType; id: number } | nu
     return { type: ConvType.Group, id: Number(convId.slice(2)) };
   }
   return null;
+}
+
+/** 私聊会话中对端用户ID */
+export function privatePeerId(convId: string, selfId: number): number {
+  const [, a, b] = convId.split("_");
+  const ua = Number(a);
+  const ub = Number(b);
+  return ua === selfId ? ub : ua;
+}
+
+/** 解析撤回通知内容，失败返回 null */
+export function parseRevokeNotice(content: string): RevokeNotice | null {
+  try {
+    const parsed = JSON.parse(content) as Partial<RevokeNotice>;
+    if (typeof parsed.targetSeq === "number" && parsed.targetSeq > 0) {
+      return { targetSeq: parsed.targetSeq, targetMsgId: String(parsed.targetMsgId ?? ""), operatorId: parsed.operatorId ?? 0 };
+    }
+  } catch { /* 非 JSON 视为无效通知 */ }
+  return null;
+}
+
+/** 解析撤回请求的 clientMsgId（revoke:{convId}:{seq}） */
+export function parseRevokeClientMsgId(clientMsgId: string): { convId: string; seq: number } | null {
+  if (!clientMsgId.startsWith(RevokeClientMsgPrefix)) return null;
+  const rest = clientMsgId.slice(RevokeClientMsgPrefix.length);
+  const idx = rest.lastIndexOf(":");
+  if (idx <= 0) return null;
+  const seq = Number(rest.slice(idx + 1));
+  if (!Number.isFinite(seq) || seq <= 0) return null;
+  return { convId: rest.slice(0, idx), seq };
 }
 
 // ──────────────────────────────────────────────────────
@@ -272,6 +316,7 @@ export enum ApiErrorCode {
   MsgNotRevocable   = 1401,
   MsgRevokeNotOwner = 1402,
   MsgDeleteFailed   = 1403,
+  ConvNotFound      = 1404,
 
   // 朋友圈 1500+
   MomentContentEmpty = 1501,
@@ -285,15 +330,12 @@ export enum ApiErrorCode {
   MuteConvExists   = 1702,
   MuteConvNotFound = 1703,
 
-  // 私聊消息 (从 Lua 脚本返回)
-  PMNotFriend  = 4001,
-  PMBlocked    = 4002,
-  PMDuplicate  = 4003,
-
-  // 群聊消息 (从 Lua 脚本返回)
-  GMNotMember  = 5001,
-  GMMuted      = 5002,
-  GMDuplicate  = 5003,
+  // 发送校验
+  MsgNotFriend  = 4001,
+  MsgBlocked    = 4002,
+  MsgDuplicate  = 4003,
+  MsgNotMember  = 5001,
+  MsgMuted      = 5002,
 }
 
 /** REST API 标准响应信封 */

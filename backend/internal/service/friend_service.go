@@ -2,9 +2,7 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -31,10 +29,11 @@ type FriendService struct {
 	mysqlRepo repository.MySQLRepo
 	redisRepo repository.RedisRepo
 	logger    *zap.Logger
-}
 
-type friendCacheRemover interface {
-	DeleteFriendCache(ctx context.Context, uidA, uidB int64) error
+	// store 用于在成为好友时创建私聊会话；relations 用于关系变更后失效缓存。
+	// 二者通过 WithMessaging 注入，为空时跳过对应步骤（便于单元测试）。
+	store     repository.MessageStore
+	relations repository.RelationCache
 }
 
 // NewFriendService 创建一个包含所有必要依赖的 FriendService。
@@ -43,6 +42,33 @@ func NewFriendService(mysqlRepo repository.MySQLRepo, redisRepo repository.Redis
 		mysqlRepo: mysqlRepo,
 		redisRepo: redisRepo,
 		logger:    logger,
+	}
+}
+
+// WithMessaging 注入会话存储与关系缓存。
+func (s *FriendService) WithMessaging(store repository.MessageStore, relations repository.RelationCache) *FriendService {
+	s.store = store
+	s.relations = relations
+	return s
+}
+
+// invalidateFriend 在好友关系变更后失效缓存；失败只记日志，缓存带 TTL 会自然过期。
+func (s *FriendService) invalidateFriend(ctx context.Context, a, b int64) {
+	if s.relations == nil {
+		return
+	}
+	if err := s.relations.InvalidateFriend(ctx, a, b); err != nil {
+		s.logger.Warn("失效好友缓存失败", zap.Int64("a", a), zap.Int64("b", b), zap.Error(err))
+	}
+}
+
+// invalidateBlock 在黑名单变更后失效缓存。
+func (s *FriendService) invalidateBlock(ctx context.Context, userID, blockedID int64) {
+	if s.relations == nil {
+		return
+	}
+	if err := s.relations.InvalidateBlock(ctx, userID, blockedID); err != nil {
+		s.logger.Warn("失效黑名单缓存失败", zap.Int64("userID", userID), zap.Int64("blockedID", blockedID), zap.Error(err))
 	}
 }
 
@@ -160,15 +186,10 @@ func (s *FriendService) AcceptFriendRequest(ctx context.Context, userID, request
 		return nil, fmt.Errorf("创建好友关系: %w", err)
 	}
 
-	// 5. 写入 Redis 好友缓存（Lua 消息校验依赖此 key）
-	if err := s.redisRepo.SetFriendCache(ctx, req.FromUserID, req.ToUserID); err != nil {
-		s.logger.Warn("设置好友缓存失败", zap.Error(err))
-		// 非致命：MySQL 已写入，缓存可在后续 IsFriend 查询时按需回填
-	}
+	// 5. 先写 DB 再失效缓存（Cache-Aside），之前缓存的"非好友"否定结果需要清掉
+	s.invalidateFriend(ctx, req.FromUserID, req.ToUserID)
 
-	// A friendship should be visible as a private conversation even before either
-	// side sends a message. Store one empty summary for each participant so the
-	// result survives refreshes and offline sessions.
+	// 成为好友后立即创建私聊会话，双方无需等第一条消息就能在会话列表中看到对方。
 	s.createPrivateConversation(ctx, req.FromUserID, req.ToUserID)
 
 	// 动态流在发布时只分发给当时已是好友的用户。建立好友关系后，
@@ -192,29 +213,19 @@ func (s *FriendService) AcceptFriendRequest(ctx context.Context, userID, request
 	return fs, nil
 }
 
+// createPrivateConversation 创建私聊会话及双方的 user_conversations 记录（均幂等）。
+// 失败只记日志：首条消息落库时 persist 消费者会自动补建双方记录。
 func (s *FriendService) createPrivateConversation(ctx context.Context, userA, userB int64) {
+	if s.store == nil {
+		return
+	}
 	convID := model.BuildConvID(model.ConvTypePrivate, userA, userB)
-	timestamp := time.Now().UnixMilli()
-	for _, entry := range []struct {
-		userID, targetID int64
-	}{{userA, userB}, {userB, userA}} {
-		target, err := s.mysqlRepo.GetUserByID(ctx, entry.targetID)
-		if err != nil {
-			s.logger.Warn("读取新好友资料失败", zap.Int64("userID", entry.targetID), zap.Error(err))
-		}
-		summary := model.ConvSummary{ConvID: convID, ConvType: model.ConvTypePrivate, TargetID: entry.targetID}
-		if target != nil {
-			summary.TargetName = target.Username
-			summary.TargetAvatar = target.AvatarURL
-		}
-		payload, err := json.Marshal(summary)
-		if err != nil {
-			s.logger.Warn("序列化新好友会话摘要失败", zap.Error(err))
-			continue
-		}
-		if err := s.redisRepo.UpdateConvList(ctx, entry.userID, convID, string(payload), timestamp); err != nil {
-			s.logger.Warn("创建新好友空会话失败", zap.Int64("userID", entry.userID), zap.Error(err))
-		}
+	if err := s.store.EnsureConversation(ctx, convID, model.ConvTypePrivate); err != nil {
+		s.logger.Warn("创建私聊会话失败", zap.String("convId", convID), zap.Error(err))
+		return
+	}
+	if err := s.store.EnsureUserConversations(ctx, convID, []int64{userA, userB}); err != nil {
+		s.logger.Warn("创建私聊用户会话失败", zap.String("convId", convID), zap.Error(err))
 	}
 }
 
@@ -363,13 +374,7 @@ func (s *FriendService) DeleteFriend(ctx context.Context, userID, friendID int64
 	if err := s.mysqlRepo.DeleteFriendship(ctx, userID, friendID); err != nil {
 		return fmt.Errorf("删除好友关系: %w", err)
 	}
-	if cache, ok := s.redisRepo.(friendCacheRemover); ok {
-		if err := cache.DeleteFriendCache(ctx, userID, friendID); err != nil {
-			// MySQL remains the source of truth; log the cache failure rather than
-			// reporting a failed deletion after the relationship is already gone.
-			s.logger.Warn("删除好友缓存失败", zap.Int64("userID", userID), zap.Int64("friendID", friendID), zap.Error(err))
-		}
-	}
+	s.invalidateFriend(ctx, userID, friendID)
 
 	s.logger.Debug("好友已删除",
 		zap.Int64("userID", userID),
@@ -397,6 +402,7 @@ func (s *FriendService) BlockUser(ctx context.Context, userID, blockedID int64) 
 	if err := s.mysqlRepo.CreateBlacklist(ctx, bl); err != nil {
 		return fmt.Errorf("创建黑名单记录: %w", err)
 	}
+	s.invalidateBlock(ctx, userID, blockedID)
 
 	s.logger.Debug("用户已拉黑",
 		zap.Int64("userID", userID),
@@ -411,6 +417,7 @@ func (s *FriendService) UnblockUser(ctx context.Context, userID, blockedID int64
 	if err := s.mysqlRepo.DeleteBlacklist(ctx, userID, blockedID); err != nil {
 		return fmt.Errorf("删除黑名单记录: %w", err)
 	}
+	s.invalidateBlock(ctx, userID, blockedID)
 
 	s.logger.Debug("用户已取消拉黑",
 		zap.Int64("userID", userID),

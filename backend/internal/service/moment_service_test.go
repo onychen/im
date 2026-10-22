@@ -12,7 +12,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/goim/goim/internal/model"
-	"github.com/goim/goim/internal/redis"
 )
 
 // ── 模拟实现 ──
@@ -181,15 +180,6 @@ func (m *mockMySQLRepo) DeleteMomentComment(ctx context.Context, id int64) error
 
 // 用 panic 桩实现所有其他 MySQLRepo 方法
 
-func (m *mockMySQLRepo) InsertPrivateMessage(_ context.Context, _ *model.PrivateMessage) error {
-	panic("未实现")
-}
-func (m *mockMySQLRepo) InsertGroupMessage(_ context.Context, _ *model.GroupMessage) error {
-	panic("未实现")
-}
-func (m *mockMySQLRepo) InsertMsgRevoked(_ context.Context, _ *model.MsgRevoked) error {
-	panic("未实现")
-}
 func (m *mockMySQLRepo) GetUserByID(_ context.Context, userID int64) (*model.User, error) {
 	if user, ok := m.users[userID]; ok {
 		return user, nil
@@ -278,9 +268,6 @@ func (m *mockMySQLRepo) GetUserSettings(_ context.Context, _ int64) (*model.User
 	panic("未实现")
 }
 func (m *mockMySQLRepo) CreateOrUpdateUserSettings(_ context.Context, _ *model.UserSettings) error {
-	panic("未实现")
-}
-func (m *mockMySQLRepo) SearchPrivateMessages(_ context.Context, _ int64, _ string, _ int, _ int) ([]model.PrivateMessage, error) {
 	panic("未实现")
 }
 
@@ -461,22 +448,7 @@ func pageOf(entries []model.FeedEntry, maxTs int64, maxID int64, limit int) []mo
 
 // 用 panic 桩实现所有其他 RedisRepo 方法
 
-func (m *momentMockRedisRepo) WriteInbox(_ context.Context, _ int64, _ *model.InboxMessage) error {
-	panic("未实现")
-}
-func (m *momentMockRedisRepo) WriteOutbox(_ context.Context, _ int64, _ *model.InboxMessage) error {
-	panic("未实现")
-}
-func (m *momentMockRedisRepo) ReadInbox(_ context.Context, _ int64, _, _ int64, _ int) ([]model.InboxMessage, error) {
-	panic("未实现")
-}
-func (m *momentMockRedisRepo) ReadOutbox(_ context.Context, _ int64, _, _ int64, _ int) ([]model.InboxMessage, error) {
-	panic("未实现")
-}
 func (m *momentMockRedisRepo) UpdateConvList(_ context.Context, _ int64, _ string, _ string, _ int64) error {
-	panic("未实现")
-}
-func (m *momentMockRedisRepo) GetConvList(_ context.Context, _ int64) ([]model.ConvSummary, error) {
 	panic("未实现")
 }
 func (m *momentMockRedisRepo) IncrementUnread(_ context.Context, _ int64, _ string) error {
@@ -523,12 +495,6 @@ func (m *momentMockRedisRepo) TrimConvListByTime(_ context.Context, _ int64, _ i
 func (m *momentMockRedisRepo) TrimTimelineByTime(_ context.Context, _ int64, _ int64) error {
 	panic("未实现")
 }
-func (m *momentMockRedisRepo) ExecPrivateMsgCheck(_ context.Context, _ int64, _ int64, _ string) (*redis.PrivateMsgCheckResult, error) {
-	panic("未实现")
-}
-func (m *momentMockRedisRepo) ExecGroupMsgCheck(_ context.Context, _ int64, _ int64, _ string) (*redis.GroupMsgCheckResult, error) {
-	panic("未实现")
-}
 func (m *momentMockRedisRepo) ExecInboxMarkRead(_ context.Context, _ int64, _ string) (int64, error) {
 	panic("未实现")
 }
@@ -556,12 +522,6 @@ func newMomentMockMQRepo() *momentMockMQRepo {
 	}
 }
 
-func (m *momentMockMQRepo) PublishPrivateMsg(_ context.Context, _ *model.PrivateMessage) error {
-	panic("未实现")
-}
-func (m *momentMockMQRepo) PublishGroupMsg(_ context.Context, _ *model.GroupMessage) error {
-	panic("未实现")
-}
 func (m *momentMockMQRepo) PublishMomentPush(_ context.Context, moment *model.Moment) error {
 	m.publishedMoments = append(m.publishedMoments, moment)
 	return nil

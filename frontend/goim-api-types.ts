@@ -51,8 +51,16 @@ export interface FriendRequestActionRequest { request_id: ApiId; }
 export interface AcceptFriendRequestResponse { user_id: ApiId; friend_id: ApiId; }
 export interface BlockUserRequest { blocked_id: ApiId; }
 
-export interface RevokeMessageRequest { convId: string; msgId: ApiId; }
-export interface SearchMessagesQuery { q: string; limit?: number; offset?: number; }
-export interface PrivateMessage { msgId: ApiId; fromId: ApiId; toId: ApiId; content: string; msgType: number; timestamp: IsoDateTime; }
+export interface RevokeMessageRequest { convId: string; seq: number; }
+export interface SearchMessagesQuery { q: string; convId?: string; limit?: number; }
+/** 与 WS 推送一致的消息结构；timestamp 为 Unix 毫秒；msgId 为雪花 ID 字符串 */
+export interface ConvMessage { convId: string; seq: number; msgId: string; convType: 1 | 2; fromId: ApiId; msgType: number; content: string; status: 0 | 1; clientMsgId?: string; timestamp: number; }
+export interface SearchMessagesResponse { msgs: ConvMessage[]; }
+export interface ConversationView { convId: string; convType: 1 | 2; targetId: ApiId; targetName: string; targetAvatar: string; maxSeq: number; readSeq: number; minSeq: number; unread: number; lastMsg?: ConvMessage; lastMsgBrief: string; lastMsgTime: number; pinned: boolean; muted: boolean; }
+export interface ConversationListResponse { conversations: ConversationView[]; }
+export interface HistoryQuery { beforeSeq?: number; limit?: number; }
+export interface HistoryResponse { msgs: ConvMessage[]; hasMore: boolean; }
+export interface MarkReadRequest { seq: number; }
+export interface RevokeMessageResponse { clientMsgId: string; serverMsgId: string; convId: string; seq: number; timestamp: number; }
 
 export interface HealthResponse { status: "ok"; service: "goim"; }
