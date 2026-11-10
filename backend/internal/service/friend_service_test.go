@@ -255,7 +255,6 @@ func (m *mockFriendRepo) DeleteMoment(_ context.Context, _ int64) error     { re
 
 // ── 桩实现：其他所有 MySQLRepo 方法 ──
 
-
 func (m *mockFriendRepo) CreateGroup(_ context.Context, _ *model.Group) (int64, error) { return 0, nil }
 func (m *mockFriendRepo) UpdateGroup(_ context.Context, _ *model.Group) error          { return nil }
 func (m *mockFriendRepo) GetGroupByID(_ context.Context, _ int64) (*model.Group, error) {
@@ -811,30 +810,3 @@ func TestFriend_GetFriendList_WithProfile(t *testing.T) {
 }
 
 // ── 高并发点赞新增接口的 mock 桩 ──
-
-func (m *mockFriendRepo) GetMomentLikers(_ context.Context, _ int64) ([]int64, error) {
-	return nil, nil
-}
-func (m *mockFriendRepo) BatchUpsertMomentLikes(_ context.Context, _ []model.MomentLike) error {
-	return nil
-}
-func (m *mockFriendRepo) BatchDeleteMomentLikes(_ context.Context, _ []model.MomentLikeKey) error {
-	return nil
-}
-
-func (m *mockFriendRedisRepo) LikeMomentAtomic(_ context.Context, _ int64, _ int64) (bool, int64, error) {
-	return false, 0, nil
-}
-func (m *mockFriendRedisRepo) UnlikeMomentAtomic(_ context.Context, _ int64, _ int64) (bool, int64, error) {
-	return false, 0, nil
-}
-func (m *mockFriendRedisRepo) EnsureMomentLikesLoaded(_ context.Context, _ int64, _ func(context.Context) ([]int64, error), _ time.Duration) error {
-	return nil
-}
-func (m *mockFriendRedisRepo) GetMomentLikeStats(_ context.Context, _ int64, _ []int64) (map[int64]int64, map[int64]bool, error) {
-	return nil, nil, nil
-}
-func (m *mockFriendRedisRepo) GetMomentLikerIDs(_ context.Context, _ int64) ([]int64, error) {
-	return nil, nil
-}
-func (m *mockFriendRedisRepo) DeleteMomentLikes(_ context.Context, _ int64) error { return nil }

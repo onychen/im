@@ -1127,6 +1127,10 @@ paths:
           description: 参数错误
           schema:
             $ref: '#/definitions/api.ApiResponse'
+        "404":
+          description: 动态不存在
+          schema:
+            $ref: '#/definitions/api.ApiResponse'
       security:
       - BearerAuth: []
       summary: 取消点赞

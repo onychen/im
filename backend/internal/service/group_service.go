@@ -41,9 +41,9 @@ type GroupService struct {
 	seqs      ConvSeqReader
 }
 
-// ConvSeqReader 返回会话当前已分配的最大 seq，由 *MsgService 实现。
+// ConvSeqReader 在会话串行机制内读取实际分配位置并应用入群边界。
 type ConvSeqReader interface {
-	CurrentSeq(ctx context.Context, convID string) (int64, error)
+	WithCurrentSeq(ctx context.Context, convID string, apply func(int64) error) error
 }
 
 // NewGroupService 使用给定的仓库和日志记录器创建一个 GroupService。
@@ -77,15 +77,14 @@ func (s *GroupService) onMemberJoined(ctx context.Context, groupID int64, userID
 	if err := s.store.EnsureConversation(ctx, convID, model.ConvTypeGroup); err != nil {
 		return fmt.Errorf("ensure group conversation: %w", err)
 	}
-	var cur int64
-	if s.seqs != nil {
-		seq, err := s.seqs.CurrentSeq(ctx, convID)
-		if err != nil {
-			return fmt.Errorf("read group conversation seq: %w", err)
-		}
-		cur = seq
+	join := func(cur int64) error {
+		return s.store.JoinConversation(ctx, convID, userIDs, cur+1)
 	}
-	if err := s.store.JoinConversation(ctx, convID, userIDs, cur+1); err != nil {
+	if s.seqs != nil {
+		if err := s.seqs.WithCurrentSeq(ctx, convID, join); err != nil {
+			return fmt.Errorf("join group conversation: %w", err)
+		}
+	} else if err := join(0); err != nil {
 		return fmt.Errorf("join group conversation: %w", err)
 	}
 	return nil

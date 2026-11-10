@@ -16,25 +16,24 @@ import (
 // ──────────────────────────────────────────────────────
 // MessageCache — 消息链路使用的 Redis 缓存与计数器
 //
-// Redis 在新链路中只承担三件事，任何一项丢失都可以从 MySQL 恢复：
-//   1. seq 计数器   seq:{convId}                 STRING，INCR 分配会话内 seq
-//   2. 发送去重     msg_dedup:{uid}:{clientMsgId} STRING，"pending" 或 serverAck JSON，TTL 5 分钟
-//   3. 热消息窗口   conv_msgs:{convId}            ZSET，score=seq，member=消息 JSON，保留最近 200 条，TTL 7 天
+// seq 由 MySQL 持久化号段 + 进程内分配；Redis 只负责发送去重与消息缓存：
+//      发送去重     msg_dedup:{uid}:{clientMsgId} STRING，"pending" 或 serverAck JSON，TTL 5 分钟
+//      私聊消息窗口 conv_msgs:{convId}            ZSET，score=seq，member=消息 JSON，保留最近 200 条，TTL 7 天
+//      群历史窗口   group_history:{convId}        STRING，数据库版本 + 最近消息 JSON，按需回填
 //      会话元数据   conv_meta:{convId}            HASH，seq + 最后一条消息 JSON，只在 seq 变大时更新
 //
-// 热消息窗口与会话元数据由 deliver 消费者写入，读路径缓存不完整时回源 MySQL。
+// msg-persist 落库后更新私聊消息窗口与会话缓存。补拉以 MySQL 的水位和消息记录为准。
 // ──────────────────────────────────────────────────────
 
 const (
-	convMsgsKeep   = 200
-	convMsgsTTL    = 7 * 24 * time.Hour
-	convMetaTTL    = 7 * 24 * time.Hour
-	msgDedupTTL    = 5 * time.Minute
-	msgDedupMarker = "pending"
+	convMsgsKeep         = 200
+	convMsgsTTL          = 7 * 24 * time.Hour
+	convMetaTTL          = 7 * 24 * time.Hour
+	msgDedupTTL          = 5 * time.Minute
+	msgDedupMarker       = "pending"
+	groupHistoryTTL      = time.Minute
+	groupHistoryMaxBytes = 512 * 1024
 )
-
-// ErrSeqNotInitialized 表示 seq 计数器不存在，需要先从 MySQL 校正后再分配。
-var ErrSeqNotInitialized = errors.New("seq 计数器未初始化")
 
 // ConvMeta 是 conv_meta 缓存中的会话最新状态。
 type ConvMeta struct {
@@ -42,14 +41,15 @@ type ConvMeta struct {
 	LastMsg *model.Message
 }
 
+type groupHistoryEntry struct {
+	Version  int64           `json:"version"`
+	Messages []model.Message `json:"messages"`
+}
+
 // MessageCache 定义消息链路的 Redis 操作，由 *MessageCacheImpl 实现。
 type MessageCache interface {
-	// NextSeq 原子分配下一个 seq；计数器不存在时返回 ErrSeqNotInitialized。
-	NextSeq(ctx context.Context, convID string) (int64, error)
-	// InitSeq 在计数器不存在时把它设置为 base（SET NX），已存在则不变。
-	InitSeq(ctx context.Context, convID string, base int64) error
-	// CurrentSeq 返回当前已分配的最大 seq；计数器不存在时 ok=false。
-	CurrentSeq(ctx context.Context, convID string) (seq int64, ok bool, err error)
+	// LegacySeq 只读旧 seq:{convId}，首次申请号段时作为迁移下限；新链路不再写此 key。
+	LegacySeq(ctx context.Context, convID string) (seq int64, ok bool, err error)
 
 	// ReserveClientMsg 占用去重 key。reserved=true 表示首次发送；
 	// reserved=false 且 ack!=nil 表示之前已成功，应直接回放 ack；两者都为空表示同一消息仍在处理中。
@@ -59,7 +59,7 @@ type MessageCache interface {
 	// ReleaseClientMsg 删除去重 key，发送失败时调用，允许客户端重试。
 	ReleaseClientMsg(ctx context.Context, senderID int64, clientMsgID string) error
 
-	// CacheMessage 把消息写入热消息窗口并推进会话元数据。
+	// CacheMessage 推进会话元数据，私聊消息还会写入热消息窗口。
 	CacheMessage(ctx context.Context, msg *model.Message) error
 	// MarkCachedRevoked 把热消息窗口中的某条消息改为已撤回；不在窗口中时忽略。
 	MarkCachedRevoked(ctx context.Context, convID string, seq int64) error
@@ -67,6 +67,9 @@ type MessageCache interface {
 	GetCachedRange(ctx context.Context, convID string, fromSeq, toSeq int64) ([]model.Message, error)
 	// GetCachedMessage 返回窗口中的单条消息；不存在时返回 nil, nil。
 	GetCachedMessage(ctx context.Context, convID string, seq int64) (*model.Message, error)
+	// GetGroupHistory 读取版本相同的群历史窗口，未命中返回 nil。
+	GetGroupHistory(ctx context.Context, convID string, version int64) ([]model.Message, error)
+	SetGroupHistory(ctx context.Context, convID string, version int64, msgs []model.Message) error
 	// GetConvMetas 批量读取会话元数据，缓存缺失的会话不出现在结果中。
 	GetConvMetas(ctx context.Context, convIDs []string) (map[string]ConvMeta, error)
 }
@@ -81,18 +84,11 @@ func NewMessageCache(rdb *goredis.Client) *MessageCacheImpl {
 
 var _ MessageCache = (*MessageCacheImpl)(nil)
 
-func seqKeyOf(convID string) string      { return "seq:" + convID }
-func convMsgsKey(convID string) string   { return "conv_msgs:" + convID }
-func convMetaKey(convID string) string   { return "conv_meta:" + convID }
+func seqKeyOf(convID string) string         { return "seq:" + convID }
+func convMsgsKey(convID string) string      { return "conv_msgs:" + convID }
+func convMetaKey(convID string) string      { return "conv_meta:" + convID }
 func dedupKey(uid int64, cid string) string { return fmt.Sprintf("msg_dedup:%d:%s", uid, cid) }
-
-// luaNextSeq：计数器存在才 INCR，避免 key 丢失后从 1 重新分配造成 seq 冲突。
-var luaNextSeq = goredis.NewScript(`
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  return -1
-end
-return redis.call('INCR', KEYS[1])
-`)
+func groupHistoryKey(convID string) string  { return "group_history:" + convID }
 
 // luaUpdateConvMeta：只有新 seq 更大时才覆盖，保证重复消费或乱序写入不会让会话元数据倒退。
 var luaUpdateConvMeta = goredis.NewScript(`
@@ -105,27 +101,9 @@ redis.call('EXPIRE', KEYS[1], ARGV[3])
 return 1
 `)
 
-// ── seq ──
+// ── 旧 seq 迁移（只读） ──
 
-func (c *MessageCacheImpl) NextSeq(ctx context.Context, convID string) (int64, error) {
-	seq, err := luaNextSeq.Run(ctx, c.rdb, []string{seqKeyOf(convID)}).Int64()
-	if err != nil {
-		return 0, fmt.Errorf("分配 seq: %w", err)
-	}
-	if seq < 0 {
-		return 0, ErrSeqNotInitialized
-	}
-	return seq, nil
-}
-
-func (c *MessageCacheImpl) InitSeq(ctx context.Context, convID string, base int64) error {
-	if err := c.rdb.SetNX(ctx, seqKeyOf(convID), base, 0).Err(); err != nil {
-		return fmt.Errorf("初始化 seq: %w", err)
-	}
-	return nil
-}
-
-func (c *MessageCacheImpl) CurrentSeq(ctx context.Context, convID string) (int64, bool, error) {
+func (c *MessageCacheImpl) LegacySeq(ctx context.Context, convID string) (int64, bool, error) {
 	seq, err := c.rdb.Get(ctx, seqKeyOf(convID)).Int64()
 	if errors.Is(err, goredis.Nil) {
 		return 0, false, nil
@@ -194,9 +172,22 @@ func (c *MessageCacheImpl) CacheMessage(ctx context.Context, msg *model.Message)
 	if err != nil {
 		return fmt.Errorf("序列化消息: %w", err)
 	}
+	if msg.ConvType != model.ConvTypeGroup {
+		if err := c.cachePrivateMessage(ctx, msg, body); err != nil {
+			return err
+		}
+	}
+	if err := luaUpdateConvMeta.Run(ctx, c.rdb, []string{convMetaKey(msg.ConvID)},
+		msg.Seq, body, int64(convMetaTTL/time.Second)).Err(); err != nil {
+		return fmt.Errorf("更新会话元数据缓存: %w", err)
+	}
+	return nil
+}
+
+func (c *MessageCacheImpl) cachePrivateMessage(ctx context.Context, msg *model.Message, body []byte) error {
 	key := convMsgsKey(msg.ConvID)
 	score := strconv.FormatInt(msg.Seq, 10)
-	_, err = c.rdb.TxPipelined(ctx, func(p goredis.Pipeliner) error {
+	_, err := c.rdb.TxPipelined(ctx, func(p goredis.Pipeliner) error {
 		// 先按 score 清掉同 seq 的旧版本，重复消费时不会出现两条同 seq 的成员
 		p.ZRemRangeByScore(ctx, key, score, score)
 		p.ZAdd(ctx, key, goredis.Z{Score: float64(msg.Seq), Member: body})
@@ -207,16 +198,12 @@ func (c *MessageCacheImpl) CacheMessage(ctx context.Context, msg *model.Message)
 	if err != nil {
 		return fmt.Errorf("写入消息缓存: %w", err)
 	}
-	if err := luaUpdateConvMeta.Run(ctx, c.rdb, []string{convMetaKey(msg.ConvID)},
-		msg.Seq, body, int64(convMetaTTL/time.Second)).Err(); err != nil {
-		return fmt.Errorf("更新会话元数据缓存: %w", err)
-	}
 	return nil
 }
 
 // MarkCachedRevoked 在 Go 侧完成读改写，而不是用 Lua 的 cjson：
 // cjson 会把雪花 ID 这类大整数编码成浮点数，导致 msgId 精度丢失。
-// 同一会话只会由 deliver 消费者的同一个分区串行写入，因此这里不存在并发覆盖。
+// 同一会话由 msg-persist 按分区顺序更新缓存。
 func (c *MessageCacheImpl) MarkCachedRevoked(ctx context.Context, convID string, seq int64) error {
 	msg, err := c.GetCachedMessage(ctx, convID, seq)
 	if err != nil || msg == nil {
@@ -272,6 +259,32 @@ func (c *MessageCacheImpl) GetCachedMessage(ctx context.Context, convID string, 
 		return nil, nil
 	}
 	return &msgs[0], nil
+}
+
+func (c *MessageCacheImpl) GetGroupHistory(ctx context.Context, convID string, version int64) ([]model.Message, error) {
+	body, err := c.rdb.Get(ctx, groupHistoryKey(convID)).Bytes()
+	if errors.Is(err, goredis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读取群历史缓存: %w", err)
+	}
+	var entry groupHistoryEntry
+	if json.Unmarshal(body, &entry) != nil || entry.Version != version {
+		return nil, nil
+	}
+	return entry.Messages, nil
+}
+
+func (c *MessageCacheImpl) SetGroupHistory(ctx context.Context, convID string, version int64, msgs []model.Message) error {
+	body, err := json.Marshal(groupHistoryEntry{Version: version, Messages: msgs})
+	if err != nil {
+		return fmt.Errorf("序列化群历史: %w", err)
+	}
+	if len(body) > groupHistoryMaxBytes {
+		return nil
+	}
+	return repoError("写入群历史缓存", c.rdb.Set(ctx, groupHistoryKey(convID), body, groupHistoryTTL).Err())
 }
 
 func (c *MessageCacheImpl) GetConvMetas(ctx context.Context, convIDs []string) (map[string]ConvMeta, error) {

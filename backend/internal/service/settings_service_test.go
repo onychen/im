@@ -154,7 +154,6 @@ func (m *mockSettingsRepo) GetMomentsByIDs(_ context.Context, _ []int64) ([]mode
 	return nil, nil
 }
 
-
 // ──────────────────────────────────────────────────────
 // Helper: new test SettingsService
 // ──────────────────────────────────────────────────────
@@ -395,13 +394,3 @@ func TestSettings_RemoveMuteConv_RemoveLast(t *testing.T) {
 }
 
 // ── 高并发点赞新增接口的 mock 桩 ──
-
-func (m *mockSettingsRepo) GetMomentLikers(_ context.Context, _ int64) ([]int64, error) {
-	return nil, nil
-}
-func (m *mockSettingsRepo) BatchUpsertMomentLikes(_ context.Context, _ []model.MomentLike) error {
-	return nil
-}
-func (m *mockSettingsRepo) BatchDeleteMomentLikes(_ context.Context, _ []model.MomentLikeKey) error {
-	return nil
-}

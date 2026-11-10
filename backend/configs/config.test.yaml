@@ -23,9 +23,8 @@ kafka:
   replication_factor: 1
 
 message:
+  seq_segment_size: 1000
   node_id: 1
-  persist_batch_size: 50
-  persist_flush_ms: 50
 
 jwt:
   secret: "test-secret"
@@ -40,6 +39,3 @@ file:
 moment:
   big_user_friend_threshold: 3
   timeline_max_len: 100
-  like_persist_batch_size: 50
-  like_persist_flush_ms: 200
-  like_cache_ttl_hours: 168

@@ -99,7 +99,6 @@ func (m *mockAuthRepo) UpdateUser(_ context.Context, user *model.User) error {
 }
 func (m *mockAuthRepo) DeleteMoment(_ context.Context, _ int64) error { return nil }
 
-
 func (m *mockAuthRepo) CreateFriendRequest(_ context.Context, _ *model.FriendRequest) error {
 	return nil
 }
@@ -431,11 +430,3 @@ func TestAuth_Refresh_ExpiredRefreshToken(t *testing.T) {
 }
 
 // ── 高并发点赞新增接口的 mock 桩 ──
-
-func (m *mockAuthRepo) GetMomentLikers(_ context.Context, _ int64) ([]int64, error) { return nil, nil }
-func (m *mockAuthRepo) BatchUpsertMomentLikes(_ context.Context, _ []model.MomentLike) error {
-	return nil
-}
-func (m *mockAuthRepo) BatchDeleteMomentLikes(_ context.Context, _ []model.MomentLikeKey) error {
-	return nil
-}

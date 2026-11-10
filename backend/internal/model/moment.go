@@ -10,12 +10,12 @@ type Moment struct {
 	Visibility int       `json:"visibility"`           // 2=好友可见，3=仅自己可见（1 为历史值，读取时按好友可见处理）
 	CreatedAt  time.Time `json:"created_at"`
 
-	// 以下字段不落库，仅在读取时由点赞缓存（Redis）填充：
-	LikeCount    int64           `json:"like_count"`  // 点赞数
-	LikedByMe    bool            `json:"liked_by_me"` // 当前查看者是否已赞
-	AuthorName   string          `json:"author_name"`
-	AuthorAvatar string          `json:"author_avatar"`
-	Comments     []MomentComment `json:"comments"`
+	// 以下展示字段在查询时填充。
+	LikeCount    int64           `json:"like_count" gorm:"-"`  // 点赞数
+	LikedByMe    bool            `json:"liked_by_me" gorm:"-"` // 当前查看者是否已赞
+	AuthorName   string          `json:"author_name" gorm:"-"`
+	AuthorAvatar string          `json:"author_avatar" gorm:"-"`
+	Comments     []MomentComment `json:"comments" gorm:"-"`
 }
 
 type MomentLike struct {
@@ -32,34 +32,14 @@ type MomentLiker struct {
 	AvatarURL string `json:"avatar_url"`
 }
 
-// MomentLikeKey 是点赞明细的联合主键 (momentID,userID)，用于批量删除。
-type MomentLikeKey struct {
-	MomentID int64
-	UserID   int64
-}
-
-// LikeEvent 是点赞/取消赞的持久化事件，经 like_persist 队列异步批量写入 MySQL。
-type LikeEvent struct {
-	MomentID int64  `json:"moment_id"`
-	UserID   int64  `json:"user_id"`
-	Action   string `json:"action"` // "like" | "unlike"
-	Ts       int64  `json:"ts"`     // 事件时间戳（毫秒），用作 moment_likes.created_at
-}
-
-// 点赞事件动作常量。
-const (
-	LikeActionLike   = "like"
-	LikeActionUnlike = "unlike"
-)
-
 type MomentComment struct {
 	ID        int64     `json:"id"`
 	MomentID  int64     `json:"moment_id"`
 	UserID    int64     `json:"user_id"`
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"created_at"`
-	Username  string    `json:"username"`
-	AvatarURL string    `json:"avatar_url"`
+	Username  string    `json:"username" gorm:"->;-:migration"`
+	AvatarURL string    `json:"avatar_url" gorm:"->;-:migration"`
 }
 
 // FeedEntry 是 Feed ZSet（收件箱/寄件箱）中的一条记录：

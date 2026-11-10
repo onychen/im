@@ -2,15 +2,17 @@ package repository
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
-	"strings"
+	"time"
 
 	"github.com/goim/goim/internal/model"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // MySQLRepo 定义了服务和消费者所需的所有 MySQL CRUD 操作。
-// 该接口允许在测试中进行模拟。方法将在任务 12-17 中逐步完善。
+// 该接口允许在测试中进行模拟。
 type MySQLRepo interface {
 	// ── 用户 ──
 	GetUserByID(ctx context.Context, userID int64) (*model.User, error)
@@ -47,10 +49,6 @@ type MySQLRepo interface {
 	DeleteMoment(ctx context.Context, id int64) error
 	GetMomentsByIDs(ctx context.Context, ids []int64) ([]model.Moment, error)
 	GetMomentsByUser(ctx context.Context, userID int64, limit, offset int) ([]model.Moment, error)
-	// 点赞明细的持久化：写路径走 Redis，MySQL 由 like_persist 消费者批量镜像。
-	GetMomentLikers(ctx context.Context, momentID int64) ([]int64, error)         // 预热回源：某动态的全部点赞用户
-	BatchUpsertMomentLikes(ctx context.Context, likes []model.MomentLike) error   // 批量落库（INSERT IGNORE）
-	BatchDeleteMomentLikes(ctx context.Context, keys []model.MomentLikeKey) error // 批量删除取消赞
 	CreateMomentComment(ctx context.Context, comment *model.MomentComment) error
 	GetMomentCommentByID(ctx context.Context, id int64) (*model.MomentComment, error)
 	GetMomentComments(ctx context.Context, momentID int64) ([]model.MomentComment, error)
@@ -61,643 +59,280 @@ type MySQLRepo interface {
 	CreateOrUpdateUserSettings(ctx context.Context, settings *model.UserSettings) error
 }
 
-// ──────────────────────────────────────────────────────
-// MySQLRepoImpl — 基于 database/sql 的具体实现
-// ──────────────────────────────────────────────────────
+// MySQLRepoImpl 使用 GORM 访问现有 MySQL 表，接口保持不变。
+type MySQLRepoImpl struct{ db *gorm.DB }
 
-type MySQLRepoImpl struct {
-	db *sql.DB
-}
+var _ MySQLRepo = (*MySQLRepoImpl)(nil)
 
-func NewMySQLRepo(db *sql.DB) *MySQLRepoImpl {
-	return &MySQLRepoImpl{db: db}
-}
+func NewMySQLRepo(db *gorm.DB) *MySQLRepoImpl { return &MySQLRepoImpl{db: db} }
 
-// ── 用户（在任务 12 中完善） ──
-
-func (m *MySQLRepoImpl) GetUserByID(ctx context.Context, userID int64) (*model.User, error) {
-	query := `SELECT id, username, password_hash, nickname, avatar_url, sign, gender, created_at, updated_at
-	          FROM users WHERE id = ?`
-	row := m.db.QueryRowContext(ctx, query, userID)
-	var u model.User
-	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Nickname, &u.AvatarURL, &u.Sign, &u.Gender, &u.CreatedAt, &u.UpdatedAt)
+func repoError(operation string, err error) error {
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("按ID获取用户: %w", err)
+		return fmt.Errorf("%s: %w", operation, err)
 	}
-	return &u, nil
+	return nil
+}
+
+// findOne 保留仓储约定：未找到记录返回 nil, nil。
+func findOne[T any](query *gorm.DB, operation string) (*T, error) {
+	var value T
+	err := query.Take(&value).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, repoError(operation, err)
+	}
+	return &value, nil
+}
+
+// ── 用户 ──
+func (m *MySQLRepoImpl) GetUserByID(ctx context.Context, userID int64) (*model.User, error) {
+	return findOne[model.User](m.db.WithContext(ctx).Where("id = ?", userID), "按ID获取用户")
 }
 
 func (m *MySQLRepoImpl) GetUserByUsername(ctx context.Context, username string) (*model.User, error) {
-	query := `SELECT id, username, password_hash, nickname, avatar_url, sign, gender, created_at, updated_at
-	          FROM users WHERE username = ?`
-	row := m.db.QueryRowContext(ctx, query, username)
-	var u model.User
-	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Nickname, &u.AvatarURL, &u.Sign, &u.Gender, &u.CreatedAt, &u.UpdatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("按用户名获取用户: %w", err)
-	}
-	return &u, nil
+	return findOne[model.User](m.db.WithContext(ctx).Where("username = ?", username), "按用户名获取用户")
 }
 
 func (m *MySQLRepoImpl) CreateUser(ctx context.Context, user *model.User) error {
-	query := `INSERT INTO users (username, password_hash, nickname, avatar_url, sign, gender)
-	          VALUES (?, ?, ?, ?, ?, ?)`
-	result, err := m.db.ExecContext(ctx, query,
-		user.Username,
-		user.PasswordHash,
-		user.Nickname,
-		user.AvatarURL,
-		user.Sign,
-		user.Gender,
-	)
-	if err != nil {
-		return fmt.Errorf("创建用户: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("创建用户 获取最后插入ID: %w", err)
-	}
-	user.ID = id
-	return nil
+	return repoError("创建用户", m.db.WithContext(ctx).Select("Username", "PasswordHash", "Nickname", "AvatarURL", "Sign", "Gender").Create(user).Error)
 }
 
 func (m *MySQLRepoImpl) UpdateUser(ctx context.Context, user *model.User) error {
-	query := `UPDATE users SET username=?, password_hash=?, nickname=?, avatar_url=?, sign=?, gender=? WHERE id=?`
-	_, err := m.db.ExecContext(ctx, query, user.Username, user.PasswordHash, user.Nickname, user.AvatarURL, user.Sign, user.Gender, user.ID)
-	if err != nil {
-		return fmt.Errorf("更新用户: %w", err)
-	}
-	return nil
+	// map 显式包含空字符串和 gender=0，避免 GORM 忽略零值。
+	return repoError("更新用户", m.db.WithContext(ctx).Model(&model.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+		"username": user.Username, "password_hash": user.PasswordHash, "nickname": user.Nickname,
+		"avatar_url": user.AvatarURL, "sign": user.Sign, "gender": user.Gender,
+	}).Error)
 }
 
-// ── 好友（在任务 13 中实现） ──
-
+// ── 好友 ──
 func (m *MySQLRepoImpl) CreateFriendRequest(ctx context.Context, req *model.FriendRequest) error {
-	query := `INSERT INTO friend_requests (from_user_id, to_user_id, message, status)
-	          VALUES (?, ?, ?, ?)
-	          ON DUPLICATE KEY UPDATE
-	              id = LAST_INSERT_ID(id),
-	              message = IF(status = 0, message, VALUES(message)),
-	              created_at = IF(status = 0, created_at, NOW()),
-	              updated_at = IF(status = 0, updated_at, NOW()),
-	              status = IF(status = 0, status, VALUES(status))`
-	result, err := m.db.ExecContext(ctx, query,
-		req.FromUserID,
-		req.ToUserID,
-		req.Message,
-		req.Status,
-	)
-	if err != nil {
-		return fmt.Errorf("插入 friend_requests: %w", err)
+	// MySQL 按赋值顺序更新：status 必须最后写，待处理申请保留原消息和时间。
+	updates := clause.Set{
+		{Column: clause.Column{Name: "id"}, Value: gorm.Expr("LAST_INSERT_ID(id)")},
+		{Column: clause.Column{Name: "message"}, Value: gorm.Expr("IF(status = 0, message, VALUES(message))")},
+		{Column: clause.Column{Name: "created_at"}, Value: gorm.Expr("IF(status = 0, created_at, NOW())")},
+		{Column: clause.Column{Name: "updated_at"}, Value: gorm.Expr("IF(status = 0, updated_at, NOW())")},
+		{Column: clause.Column{Name: "status"}, Value: gorm.Expr("IF(status = 0, status, VALUES(status))")},
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("插入 friend_requests 获取最后插入ID: %w", err)
-	}
-	req.ID = id
-	return nil
+	return repoError("插入好友请求", m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Select("FromUserID", "ToUserID", "Message", "Status").Clauses(clause.OnConflict{DoUpdates: updates}).Create(req).Error; err != nil {
+			return err
+		}
+		// 完全未变化的重复申请 RowsAffected=0，GORM 不会回填 LastInsertId。
+		if req.ID == 0 {
+			var existing model.FriendRequest
+			if err := tx.Select("id").Where("from_user_id = ? AND to_user_id = ?", req.FromUserID, req.ToUserID).Take(&existing).Error; err != nil {
+				return err
+			}
+			req.ID = existing.ID
+		}
+		return nil
+	}))
 }
 
 func (m *MySQLRepoImpl) UpdateFriendRequest(ctx context.Context, req *model.FriendRequest) error {
-	query := `UPDATE friend_requests SET status=?, updated_at=NOW() WHERE id=?`
-	_, err := m.db.ExecContext(ctx, query, req.Status, req.ID)
-	if err != nil {
-		return fmt.Errorf("更新 friend_requests: %w", err)
-	}
-	return nil
+	return repoError("更新好友请求", m.db.WithContext(ctx).Model(&model.FriendRequest{}).Where("id = ?", req.ID).Updates(map[string]any{"status": req.Status, "updated_at": gorm.Expr("NOW()")}).Error)
 }
 
 func (m *MySQLRepoImpl) GetFriendRequestByID(ctx context.Context, id int64) (*model.FriendRequest, error) {
-	query := `SELECT id, from_user_id, to_user_id, message, status, created_at, updated_at
-	          FROM friend_requests WHERE id = ?`
-	row := m.db.QueryRowContext(ctx, query, id)
-	var r model.FriendRequest
-	err := row.Scan(&r.ID, &r.FromUserID, &r.ToUserID, &r.Message, &r.Status, &r.CreatedAt, &r.UpdatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("按ID获取好友请求: %w", err)
-	}
-	return &r, nil
+	return findOne[model.FriendRequest](m.db.WithContext(ctx).Where("id = ?", id), "按ID获取好友请求")
 }
 
 func (m *MySQLRepoImpl) GetFriendRequestsByUser(ctx context.Context, userID int64) ([]model.FriendRequest, error) {
-	query := `SELECT id, from_user_id, to_user_id, message, status, created_at, updated_at
-	          FROM friend_requests
-	          WHERE to_user_id = ? AND status = 0
-	          ORDER BY created_at DESC`
-	rows, err := m.db.QueryContext(ctx, query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("按用户获取好友请求: %w", err)
-	}
-	defer rows.Close()
-
-	var results []model.FriendRequest
-	for rows.Next() {
-		var r model.FriendRequest
-		if err := rows.Scan(&r.ID, &r.FromUserID, &r.ToUserID, &r.Message, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("扫描好友请求: %w", err)
-		}
-		results = append(results, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历好友请求: %w", err)
-	}
-	return results, nil
+	var requests []model.FriendRequest
+	err := m.db.WithContext(ctx).Where("to_user_id = ? AND status = ?", userID, 0).Order("created_at DESC").Find(&requests).Error
+	return requests, repoError("按用户获取好友请求", err)
 }
 
 func (m *MySQLRepoImpl) CreateFriendship(ctx context.Context, fs *model.Friendship) error {
-	// 插入双向记录：user->friend 和 friend->user
-	query := `INSERT INTO friendships (user_id, friend_id) VALUES (?, ?)`
-	_, err := m.db.ExecContext(ctx, query, fs.UserID, fs.FriendID)
-	if err != nil {
-		return fmt.Errorf("插入好友关系 user->friend: %w", err)
-	}
-	_, err = m.db.ExecContext(ctx, query, fs.FriendID, fs.UserID)
-	if err != nil {
-		return fmt.Errorf("插入好友关系 friend->user: %w", err)
-	}
-	return nil
+	// 双向关系必须一起成功；任一方向冲突时整个事务回滚。
+	return repoError("插入双向好友关系", m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		pairs := []model.Friendship{{UserID: fs.UserID, FriendID: fs.FriendID}, {UserID: fs.FriendID, FriendID: fs.UserID}}
+		return tx.Select("UserID", "FriendID").Create(&pairs).Error
+	}))
 }
 
 func (m *MySQLRepoImpl) DeleteFriendship(ctx context.Context, userID, friendID int64) error {
-	// 删除双向记录：user->friend 和 friend->user
-	query := `DELETE FROM friendships WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)`
-	_, err := m.db.ExecContext(ctx, query, userID, friendID, friendID, userID)
-	if err != nil {
-		return fmt.Errorf("删除好友关系: %w", err)
-	}
-	return nil
+	return repoError("删除好友关系", m.db.WithContext(ctx).Where("(user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)", userID, friendID, friendID, userID).Delete(&model.Friendship{}).Error)
 }
 
 func (m *MySQLRepoImpl) GetFriendList(ctx context.Context, userID int64) ([]model.Friendship, error) {
-	query := `SELECT f.id, f.user_id, f.friend_id, f.created_at
-	          FROM friendships f
-	          WHERE f.user_id = ?`
-	rows, err := m.db.QueryContext(ctx, query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("获取好友列表: %w", err)
-	}
-	defer rows.Close()
-
-	var results []model.Friendship
-	for rows.Next() {
-		var fs model.Friendship
-		if err := rows.Scan(&fs.ID, &fs.UserID, &fs.FriendID, &fs.CreatedAt); err != nil {
-			return nil, fmt.Errorf("扫描好友关系: %w", err)
-		}
-		results = append(results, fs)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历好友关系: %w", err)
-	}
-	return results, nil
+	var friends []model.Friendship
+	err := m.db.WithContext(ctx).Where("user_id = ?", userID).Find(&friends).Error
+	return friends, repoError("获取好友列表", err)
 }
 
 func (m *MySQLRepoImpl) CountFriends(ctx context.Context, userID int64) (int, error) {
-	// 走 friendships 的 idx_user 索引，成本低
-	query := `SELECT COUNT(*) FROM friendships WHERE user_id = ?`
-	var count int
-	if err := m.db.QueryRowContext(ctx, query, userID).Scan(&count); err != nil {
-		return 0, fmt.Errorf("统计好友数: %w", err)
-	}
-	return count, nil
+	var count int64
+	err := m.db.WithContext(ctx).Model(&model.Friendship{}).Where("user_id = ?", userID).Count(&count).Error
+	return int(count), repoError("统计好友数", err)
 }
 
 func (m *MySQLRepoImpl) IsFriend(ctx context.Context, userID, friendID int64) (bool, error) {
-	query := `SELECT COUNT(*) FROM friendships WHERE user_id = ? AND friend_id = ?`
-	var count int
-	err := m.db.QueryRowContext(ctx, query, userID, friendID).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("检查是否为好友: %w", err)
-	}
-	return count > 0, nil
+	var count int64
+	err := m.db.WithContext(ctx).Model(&model.Friendship{}).Where("user_id = ? AND friend_id = ?", userID, friendID).Count(&count).Error
+	return count > 0, repoError("检查是否为好友", err)
 }
 
 func (m *MySQLRepoImpl) CreateBlacklist(ctx context.Context, bl *model.Blacklist) error {
-	query := `INSERT INTO blacklist (user_id, blocked_id) VALUES (?, ?)`
-	result, err := m.db.ExecContext(ctx, query, bl.UserID, bl.BlockedID)
-	if err != nil {
-		return fmt.Errorf("插入黑名单: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("插入黑名单 获取最后插入ID: %w", err)
-	}
-	bl.ID = id
-	return nil
+	return repoError("插入黑名单", m.db.WithContext(ctx).Select("UserID", "BlockedID").Create(bl).Error)
 }
 
 func (m *MySQLRepoImpl) DeleteBlacklist(ctx context.Context, userID, blockedID int64) error {
-	query := `DELETE FROM blacklist WHERE user_id = ? AND blocked_id = ?`
-	_, err := m.db.ExecContext(ctx, query, userID, blockedID)
-	if err != nil {
-		return fmt.Errorf("删除黑名单: %w", err)
-	}
-	return nil
+	return repoError("删除黑名单", m.db.WithContext(ctx).Where("user_id = ? AND blocked_id = ?", userID, blockedID).Delete(&model.Blacklist{}).Error)
 }
 
 func (m *MySQLRepoImpl) IsBlocked(ctx context.Context, userID, blockedID int64) (bool, error) {
-	query := `SELECT COUNT(*) FROM blacklist WHERE user_id = ? AND blocked_id = ?`
-	var count int
-	err := m.db.QueryRowContext(ctx, query, userID, blockedID).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("检查是否已拉黑: %w", err)
-	}
-	return count > 0, nil
+	var count int64
+	err := m.db.WithContext(ctx).Model(&model.Blacklist{}).Where("user_id = ? AND blocked_id = ?", userID, blockedID).Count(&count).Error
+	return count > 0, repoError("检查是否已拉黑", err)
 }
 
-// ── 群组（在任务 14 中完善） ──
-
+// ── 群组 ──
 func (m *MySQLRepoImpl) CreateGroup(ctx context.Context, group *model.Group) (int64, error) {
-	query := "INSERT INTO `groups` (name, notice, owner_id, max_members, created_at, updated_at) VALUES (?, ?, ?, 500, NOW(), NOW())"
-	result, err := m.db.ExecContext(ctx, query,
-		group.Name,
-		group.Notice,
-		group.OwnerID,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("创建群组: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("创建群组 获取最后插入ID: %w", err)
-	}
-	return id, nil
+	row := model.Group{Name: group.Name, Notice: group.Notice, OwnerID: group.OwnerID, MaxMembers: 500}
+	err := m.db.WithContext(ctx).Create(&row).Error
+	return row.ID, repoError("创建群组", err)
 }
 
 func (m *MySQLRepoImpl) UpdateGroup(ctx context.Context, group *model.Group) error {
-	query := "UPDATE `groups` SET name=?, notice=?, owner_id=?, updated_at=NOW() WHERE id=?"
-	_, err := m.db.ExecContext(ctx, query, group.Name, group.Notice, group.OwnerID, group.ID)
-	if err != nil {
-		return fmt.Errorf("更新群组: %w", err)
-	}
-	return nil
+	return repoError("更新群组", m.db.WithContext(ctx).Model(&model.Group{}).Where("id = ?", group.ID).Updates(map[string]any{"name": group.Name, "notice": group.Notice, "owner_id": group.OwnerID}).Error)
 }
 
 func (m *MySQLRepoImpl) GetGroupByID(ctx context.Context, groupID int64) (*model.Group, error) {
-	query := "SELECT id, name, notice, owner_id, max_members, created_at, updated_at FROM `groups` WHERE id = ?"
-	row := m.db.QueryRowContext(ctx, query, groupID)
-	var g model.Group
-	err := row.Scan(&g.ID, &g.Name, &g.Notice, &g.OwnerID, &g.MaxMembers, &g.CreatedAt, &g.UpdatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("按ID获取群组: %w", err)
-	}
-	return &g, nil
+	return findOne[model.Group](m.db.WithContext(ctx).Where("id = ?", groupID), "按ID获取群组")
 }
 
 func (m *MySQLRepoImpl) AddGroupMember(ctx context.Context, member *model.GroupMember) error {
-	query := `INSERT INTO group_members (group_id, user_id, role, muted_until, joined_at)
-	          VALUES (?, ?, ?, ?, NOW())`
-	_, err := m.db.ExecContext(ctx, query,
-		member.GroupID,
-		member.UserID,
-		member.Role,
-		member.MutedUntil,
-	)
-	if err != nil {
-		return fmt.Errorf("添加群成员: %w", err)
-	}
-	return nil
+	// joined_at 由数据库默认值填充。
+	return repoError("添加群成员", m.db.WithContext(ctx).Select("GroupID", "UserID", "Role", "MutedUntil").Create(member).Error)
 }
 
 func (m *MySQLRepoImpl) RemoveGroupMember(ctx context.Context, groupID, userID int64) error {
-	query := `DELETE FROM group_members WHERE group_id=? AND user_id=?`
-	_, err := m.db.ExecContext(ctx, query, groupID, userID)
-	if err != nil {
-		return fmt.Errorf("移除群成员: %w", err)
-	}
-	return nil
+	return repoError("移除群成员", m.db.WithContext(ctx).Where("group_id = ? AND user_id = ?", groupID, userID).Delete(&model.GroupMember{}).Error)
 }
 
 func (m *MySQLRepoImpl) GetGroupMembers(ctx context.Context, groupID int64) ([]model.GroupMember, error) {
-	query := `SELECT id, group_id, user_id, role, muted_until, joined_at
-	          FROM group_members WHERE group_id = ?`
-	rows, err := m.db.QueryContext(ctx, query, groupID)
-	if err != nil {
-		return nil, fmt.Errorf("获取群成员: %w", err)
-	}
-	defer rows.Close()
-
-	members := make([]model.GroupMember, 0)
-	for rows.Next() {
-		var gm model.GroupMember
-		err := rows.Scan(&gm.ID, &gm.GroupID, &gm.UserID, &gm.Role, &gm.MutedUntil, &gm.JoinedAt)
-		if err != nil {
-			return nil, fmt.Errorf("扫描群成员: %w", err)
-		}
-		members = append(members, gm)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历群成员: %w", err)
-	}
-	return members, nil
+	var members []model.GroupMember
+	err := m.db.WithContext(ctx).Where("group_id = ?", groupID).Find(&members).Error
+	return members, repoError("获取群成员", err)
 }
 
 func (m *MySQLRepoImpl) UpdateGroupMemberRole(ctx context.Context, groupID, userID, role int) error {
-	query := `UPDATE group_members SET role=? WHERE group_id=? AND user_id=?`
-	_, err := m.db.ExecContext(ctx, query, role, groupID, userID)
-	if err != nil {
-		return fmt.Errorf("更新群成员角色: %w", err)
-	}
-	return nil
+	return repoError("更新群成员角色", m.db.WithContext(ctx).Model(&model.GroupMember{}).Where("group_id = ? AND user_id = ?", groupID, userID).Update("role", role).Error)
 }
 
 // ── 朋友圈 ──
-
 func (m *MySQLRepoImpl) CreateMoment(ctx context.Context, moment *model.Moment) error {
-	query := `INSERT INTO moments (author_id, content, media_urls, visibility, created_at)
-	          VALUES (?, ?, ?, ?, ?)`
-	result, err := m.db.ExecContext(ctx, query,
-		moment.AuthorID,
-		moment.Content,
-		moment.MediaUrls,
-		moment.Visibility,
-		moment.CreatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("插入朋友圈动态: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("插入朋友圈动态 获取最后插入ID: %w", err)
-	}
-	moment.ID = id
-	return nil
+	return repoError("插入朋友圈动态", m.db.WithContext(ctx).Create(moment).Error)
 }
 
 func (m *MySQLRepoImpl) GetMomentByID(ctx context.Context, id int64) (*model.Moment, error) {
-	query := `SELECT id, author_id, content, media_urls, visibility, created_at
-	          FROM moments WHERE id = ?`
-	row := m.db.QueryRowContext(ctx, query, id)
-	var moment model.Moment
-	err := row.Scan(&moment.ID, &moment.AuthorID, &moment.Content, &moment.MediaUrls, &moment.Visibility, &moment.CreatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("按ID获取朋友圈动态: %w", err)
-	}
-	return &moment, nil
+	return findOne[model.Moment](m.db.WithContext(ctx).Where("id = ?", id), "按ID获取朋友圈动态")
 }
 
-// DeleteMoment 删除动态及其关联评论、持久化点赞明细。三张表不设外键，因此在事务内显式清理。
 func (m *MySQLRepoImpl) DeleteMoment(ctx context.Context, id int64) error {
-	tx, err := m.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("开启删除动态事务: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	for _, query := range []string{
-		`DELETE FROM moment_comments WHERE moment_id = ?`,
-		`DELETE FROM moment_likes WHERE moment_id = ?`,
-		`DELETE FROM moments WHERE id = ?`,
-	} {
-		if _, err := tx.ExecContext(ctx, query, id); err != nil {
-			return fmt.Errorf("删除动态关联数据: %w", err)
+	return repoError("删除动态及关联数据", m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockMoment(tx, id); err != nil {
+			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("提交删除动态事务: %w", err)
-	}
-	return nil
+		if err := tx.Where("moment_id = ?", id).Delete(&model.MomentComment{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("moment_id = ?", id).Delete(&model.MomentLike{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&model.Moment{}).Error
+	}))
 }
 
-// GetMomentsByIDs 批量按 ID 查询动态，用于 Feed 补全，消除 N+1 查询。
-// 返回的顺序不保证与入参一致；调用方应按需自行重排（例如按 Feed 游标顺序）。
 func (m *MySQLRepoImpl) GetMomentsByIDs(ctx context.Context, ids []int64) ([]model.Moment, error) {
+	moments := make([]model.Moment, 0)
 	if len(ids) == 0 {
-		return []model.Moment{}, nil
+		return moments, nil
 	}
-
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-
-	query := fmt.Sprintf(`SELECT id, author_id, content, media_urls, visibility, created_at
-	          FROM moments WHERE id IN (%s)`, strings.Join(placeholders, ","))
-	rows, err := m.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("按ID批量获取朋友圈动态: %w", err)
-	}
-	defer rows.Close()
-
-	moments := make([]model.Moment, 0, len(ids))
-	for rows.Next() {
-		var moment model.Moment
-		if err := rows.Scan(&moment.ID, &moment.AuthorID, &moment.Content, &moment.MediaUrls, &moment.Visibility, &moment.CreatedAt); err != nil {
-			return nil, fmt.Errorf("扫描朋友圈动态: %w", err)
-		}
-		moments = append(moments, moment)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历结果行错误: %w", err)
-	}
-	return moments, nil
+	err := m.db.WithContext(ctx).Where("id IN ?", ids).Find(&moments).Error
+	return moments, repoError("按ID批量获取朋友圈动态", err)
 }
 
 func (m *MySQLRepoImpl) GetMomentsByUser(ctx context.Context, userID int64, limit, offset int) ([]model.Moment, error) {
-	query := `SELECT id, author_id, content, media_urls, visibility, created_at
-	          FROM moments WHERE author_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
-	rows, err := m.db.QueryContext(ctx, query, userID, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("按用户获取朋友圈动态: %w", err)
-	}
-	defer rows.Close()
-
 	moments := make([]model.Moment, 0)
-	for rows.Next() {
-		var moment model.Moment
-		if err := rows.Scan(&moment.ID, &moment.AuthorID, &moment.Content, &moment.MediaUrls, &moment.Visibility, &moment.CreatedAt); err != nil {
-			return nil, fmt.Errorf("扫描朋友圈动态: %w", err)
-		}
-		moments = append(moments, moment)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历结果行错误: %w", err)
-	}
-	return moments, nil
-}
-
-// GetMomentLikers 返回某条动态的全部点赞用户 ID，用于 Redis 点赞缓存的冷启动预热。走 idx_moment。
-func (m *MySQLRepoImpl) GetMomentLikers(ctx context.Context, momentID int64) ([]int64, error) {
-	query := `SELECT user_id FROM moment_likes WHERE moment_id = ?`
-	rows, err := m.db.QueryContext(ctx, query, momentID)
-	if err != nil {
-		return nil, fmt.Errorf("查询动态点赞用户: %w", err)
-	}
-	defer rows.Close()
-
-	userIDs := make([]int64, 0)
-	for rows.Next() {
-		var uid int64
-		if err := rows.Scan(&uid); err != nil {
-			return nil, fmt.Errorf("扫描点赞用户: %w", err)
-		}
-		userIDs = append(userIDs, uid)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历点赞用户结果: %w", err)
-	}
-	return userIDs, nil
-}
-
-// BatchUpsertMomentLikes 批量写入点赞明细。INSERT IGNORE 依赖唯一键 uk_moment_user 幂等去重，
-// 因此消费者重投（requeue）重复执行安全。
-func (m *MySQLRepoImpl) BatchUpsertMomentLikes(ctx context.Context, likes []model.MomentLike) error {
-	if len(likes) == 0 {
-		return nil
-	}
-	placeholders := make([]string, len(likes))
-	args := make([]interface{}, 0, len(likes)*3)
-	for i, lk := range likes {
-		placeholders[i] = "(?, ?, ?)"
-		args = append(args, lk.MomentID, lk.UserID, lk.CreatedAt)
-	}
-	query := fmt.Sprintf(`INSERT IGNORE INTO moment_likes (moment_id, user_id, created_at) VALUES %s`,
-		strings.Join(placeholders, ","))
-	if _, err := m.db.ExecContext(ctx, query, args...); err != nil {
-		return fmt.Errorf("批量插入朋友圈点赞: %w", err)
-	}
-	return nil
-}
-
-// BatchDeleteMomentLikes 批量删除点赞明细（取消赞）。DELETE 幂等，重投安全。
-func (m *MySQLRepoImpl) BatchDeleteMomentLikes(ctx context.Context, keys []model.MomentLikeKey) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	placeholders := make([]string, len(keys))
-	args := make([]interface{}, 0, len(keys)*2)
-	for i, k := range keys {
-		placeholders[i] = "(?, ?)"
-		args = append(args, k.MomentID, k.UserID)
-	}
-	query := fmt.Sprintf(`DELETE FROM moment_likes WHERE (moment_id, user_id) IN (%s)`,
-		strings.Join(placeholders, ","))
-	if _, err := m.db.ExecContext(ctx, query, args...); err != nil {
-		return fmt.Errorf("批量删除朋友圈点赞: %w", err)
-	}
-	return nil
+	err := m.db.WithContext(ctx).Where("author_id = ?", userID).Order("created_at DESC").Limit(limit).Offset(offset).Find(&moments).Error
+	return moments, repoError("按用户获取朋友圈动态", err)
 }
 
 func (m *MySQLRepoImpl) CreateMomentComment(ctx context.Context, comment *model.MomentComment) error {
-	query := `INSERT INTO moment_comments (moment_id, user_id, content, created_at) VALUES (?, ?, ?, ?)`
-	result, err := m.db.ExecContext(ctx, query, comment.MomentID, comment.UserID, comment.Content, comment.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("插入朋友圈评论: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("获取朋友圈评论最后插入 ID: %w", err)
-	}
-	comment.ID = id
-	return nil
+	return repoError("插入朋友圈评论", m.db.WithContext(ctx).Create(comment).Error)
 }
 
 func (m *MySQLRepoImpl) GetMomentCommentByID(ctx context.Context, id int64) (*model.MomentComment, error) {
-	query := `SELECT id, moment_id, user_id, content, created_at
-	          FROM moment_comments WHERE id = ?`
-	row := m.db.QueryRowContext(ctx, query, id)
-	var comment model.MomentComment
-	err := row.Scan(&comment.ID, &comment.MomentID, &comment.UserID, &comment.Content, &comment.CreatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("按ID获取朋友圈评论: %w", err)
-	}
-	return &comment, nil
+	return findOne[model.MomentComment](m.db.WithContext(ctx).Select("id", "moment_id", "user_id", "content", "created_at").Where("id = ?", id), "按ID获取朋友圈评论")
 }
 
 func (m *MySQLRepoImpl) GetMomentComments(ctx context.Context, momentID int64) ([]model.MomentComment, error) {
-	query := `SELECT c.id, c.moment_id, c.user_id, c.content, c.created_at, u.username, u.avatar_url
-	          FROM moment_comments c JOIN users u ON u.id = c.user_id
-	          WHERE c.moment_id = ? ORDER BY c.id ASC`
-	rows, err := m.db.QueryContext(ctx, query, momentID)
-	if err != nil {
-		return nil, fmt.Errorf("获取朋友圈评论列表: %w", err)
-	}
-	defer rows.Close()
 	comments := make([]model.MomentComment, 0)
-	for rows.Next() {
-		var comment model.MomentComment
-		if err := rows.Scan(&comment.ID, &comment.MomentID, &comment.UserID, &comment.Content, &comment.CreatedAt, &comment.Username, &comment.AvatarURL); err != nil {
-			return nil, fmt.Errorf("扫描朋友圈评论: %w", err)
-		}
-		comments = append(comments, comment)
-	}
-	return comments, rows.Err()
+	err := m.db.WithContext(ctx).Table("moment_comments AS c").Select("c.id, c.moment_id, c.user_id, c.content, c.created_at, u.username, u.avatar_url").Joins("JOIN users u ON u.id = c.user_id").Where("c.moment_id = ?", momentID).Order("c.id ASC").Scan(&comments).Error
+	return comments, repoError("获取朋友圈评论列表", err)
 }
 
 func (m *MySQLRepoImpl) DeleteMomentComment(ctx context.Context, id int64) error {
-	query := `DELETE FROM moment_comments WHERE id = ?`
-	_, err := m.db.ExecContext(ctx, query, id)
-	if err != nil {
-		return fmt.Errorf("删除朋友圈评论: %w", err)
-	}
-	return nil
+	return repoError("删除朋友圈评论", m.db.WithContext(ctx).Where("id = ?", id).Delete(&model.MomentComment{}).Error)
 }
 
-// ── 用户设置（在任务 17 中完善） ──
+// settingsRecord 将 API 中的空字符串转换为数据库 JSON NULL。
+type settingsRecord struct {
+	ID                  int64
+	UserID              int64
+	NotificationEnabled bool
+	MsgPreviewEnabled   bool
+	MuteList            *string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+func (settingsRecord) TableName() string { return "user_settings" }
 
 func (m *MySQLRepoImpl) GetUserSettings(ctx context.Context, userID int64) (*model.UserSettings, error) {
-	query := `SELECT id, user_id, notification_enabled, msg_preview_enabled, mute_list, created_at, updated_at
-	          FROM user_settings WHERE user_id = ?`
-	row := m.db.QueryRowContext(ctx, query, userID)
-	var s model.UserSettings
-	var muteList sql.NullString
-	err := row.Scan(&s.ID, &s.UserID, &s.NotificationEnabled, &s.MsgPreviewEnabled, &muteList, &s.CreatedAt, &s.UpdatedAt)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("获取用户设置: %w", err)
+	row, err := findOne[settingsRecord](m.db.WithContext(ctx).Where("user_id = ?", userID), "获取用户设置")
+	if err != nil || row == nil {
+		return nil, err
 	}
-	if muteList.Valid {
-		s.MuteList = muteList.String
+	settings := &model.UserSettings{ID: row.ID, UserID: row.UserID, NotificationEnabled: row.NotificationEnabled, MsgPreviewEnabled: row.MsgPreviewEnabled, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	if row.MuteList != nil {
+		settings.MuteList = *row.MuteList
 	}
-	return &s, nil
+	return settings, nil
 }
 
 func (m *MySQLRepoImpl) CreateOrUpdateUserSettings(ctx context.Context, settings *model.UserSettings) error {
-	query := `INSERT INTO user_settings (user_id, notification_enabled, msg_preview_enabled, mute_list)
-	          VALUES (?, ?, ?, ?)
-	          ON DUPLICATE KEY UPDATE notification_enabled=VALUES(notification_enabled),
-	          msg_preview_enabled=VALUES(msg_preview_enabled), mute_list=VALUES(mute_list)`
-	var muteList interface{}
-	if settings.MuteList == "" {
-		muteList = nil
-	} else {
-		muteList = settings.MuteList
+	row := settingsRecord{UserID: settings.UserID, NotificationEnabled: settings.NotificationEnabled, MsgPreviewEnabled: settings.MsgPreviewEnabled}
+	if settings.MuteList != "" {
+		row.MuteList = &settings.MuteList
 	}
-	result, err := m.db.ExecContext(ctx, query,
-		settings.UserID,
-		settings.NotificationEnabled,
-		settings.MsgPreviewEnabled,
-		muteList,
-	)
-	if err != nil {
-		return fmt.Errorf("创建或更新用户设置: %w", err)
+	updates := clause.Set{
+		{Column: clause.Column{Name: "id"}, Value: gorm.Expr("LAST_INSERT_ID(id)")},
+		{Column: clause.Column{Name: "notification_enabled"}, Value: gorm.Expr("VALUES(notification_enabled)")},
+		{Column: clause.Column{Name: "msg_preview_enabled"}, Value: gorm.Expr("VALUES(msg_preview_enabled)")},
+		{Column: clause.Column{Name: "mute_list"}, Value: gorm.Expr("VALUES(mute_list)")},
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		// ON DUPLICATE KEY UPDATE: LastInsertId 在存在更新时可能无意义，但忽略该错误
+	err := m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Select("UserID", "NotificationEnabled", "MsgPreviewEnabled", "MuteList").Clauses(clause.OnConflict{DoUpdates: updates}).Create(&row).Error; err != nil {
+			return err
+		}
+		if row.ID == 0 {
+			var existing settingsRecord
+			if err := tx.Select("id").Where("user_id = ?", row.UserID).Take(&existing).Error; err != nil {
+				return err
+			}
+			row.ID = existing.ID
+		}
 		return nil
+	})
+	if err == nil {
+		settings.ID = row.ID
 	}
-	settings.ID = id
-	return nil
+	return repoError("创建或更新用户设置", err)
 }

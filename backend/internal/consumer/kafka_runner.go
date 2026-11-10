@@ -167,7 +167,7 @@ func publishDeadLetter(ctx context.Context, logger *zap.Logger, name string, dlq
 	for {
 		err := dlq.Writer.WriteMessages(ctx, out...)
 		if err == nil {
-			logger.Error("Kafka 消息重试达到上限，已转投死信队列",
+			logger.Error("Kafka 消息已转投死信队列",
 				zap.String("consumer", name),
 				zap.String("dlqTopic", dlq.Topic),
 				zap.Int("messages", len(msgs)),

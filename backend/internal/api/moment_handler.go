@@ -296,6 +296,7 @@ func (h *MomentHandler) LikeMoment(c *gin.Context) {
 // @Param        momentID  path  int64  true  "动态ID"
 // @Success      200  {object}  ApiResponse{data=unlikeMomentResponse}  "取消点赞成功"
 // @Failure      400  {object}  ApiResponse  "参数错误"
+// @Failure      404  {object}  ApiResponse  "动态不存在"
 // @Router       /moment/{momentID}/like [delete]
 // UnlikeMoment 处理 DELETE /api/v1/moment/:momentID/like 请求。
 func (h *MomentHandler) UnlikeMoment(c *gin.Context) {
@@ -314,7 +315,11 @@ func (h *MomentHandler) UnlikeMoment(c *gin.Context) {
 
 	count, err := h.momentSvc.UnlikeMoment(c.Request.Context(), userID.(int64), momentID)
 	if err != nil {
-		Error(c, http.StatusInternalServerError, CodeInternalError, "内部错误")
+		if err.Error() == service.ErrMomentNotFound {
+			ServiceError(c, http.StatusNotFound, err.Error())
+		} else {
+			Error(c, http.StatusInternalServerError, CodeInternalError, "内部错误")
+		}
 		return
 	}
 

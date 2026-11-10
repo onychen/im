@@ -41,7 +41,7 @@ describe("chat message state", () => {
     vi.useFakeTimers();
     vi.restoreAllMocks();
     vi.spyOn(goimSocket, "send").mockReturnValue(true);
-    useChatStore.setState({ mode: null, liveUserId: null, connectionState: "idle", syncCompleted: false, conversations: [], messagesByConversation: {}, historyHasMore: {}, toasts: [] });
+    useChatStore.setState({ mode: null, liveUserId: null, connectionState: "idle", syncCompleted: false, conversations: [], messagesByConversation: {}, historyHasMore: {}, historyBeforeSeq: {}, toasts: [] });
   });
 
   it("hydrates the preview conversations", () => {
@@ -74,11 +74,43 @@ describe("chat message state", () => {
     });
   });
 
-  it("requests the latest window for a conversation seen for the first time", () => {
+  it("leaves first synchronization to actual-message history pagination", () => {
     useChatStore.getState().initializeLive(1);
     const pulls = useChatStore.getState().applyConvSync([convView({ convId: "p_1_2", maxSeq: 120, readSeq: 100, unread: 20 })]);
-    expect(pulls).toEqual([{ convId: "p_1_2", fromSeq: 71, toSeq: 120 }]);
+    expect(pulls).toEqual([]);
     expect(useChatStore.getState().conversations[0]).toMatchObject({ unread: 20, maxSeq: 120, readSeq: 100, syncedSeq: 0 });
+  });
+
+  it("initializes the latest fifty actual messages across segment gaps", () => {
+    useChatStore.getState().initializeLive(1);
+    useChatStore.getState().applyConvSync([convView({ convId: "p_1_2", maxSeq: 1001, unread: 2 })]);
+    const seqs = [...Array.from({ length: 49 }, (_, index) => index + 12), 1001];
+    const next = useChatStore.getState().applyInitialHistory("p_1_2", seqs.map((seq) => wsMsg({ convId: "p_1_2", seq, fromId: 2 })), true, 1);
+    expect(next).toBeNull();
+    const state = useChatStore.getState();
+    expect(state.messagesByConversation["p_1_2"].map((item) => item.seq)).toEqual(seqs);
+    expect(state.conversations[0]).toMatchObject({ syncedSeq: 1001, initialHistoryLoaded: true, unread: 2 });
+    expect(state.historyHasMore["p_1_2"]).toBe(true);
+    expect(state.applyConvSync([convView({ convId: "p_1_2", maxSeq: 2001 })])).toEqual([{ convId: "p_1_2", fromSeq: 1002, toSeq: 2001 }]);
+  });
+
+  it("fills the interval between the history snapshot and concurrent pushes", () => {
+    useChatStore.getState().initializeLive(1);
+    useChatStore.getState().applyConvSync([convView({ convId: "p_1_2", maxSeq: 1001 })]);
+    useChatStore.getState().receiveMessage(wsMsg({ convId: "p_1_2", seq: 1002, fromId: 2 }), 1);
+    const next = useChatStore.getState().applyInitialHistory("p_1_2", [12, 1001].map((seq) => wsMsg({ convId: "p_1_2", seq, fromId: 2 })), false, 1);
+    expect(next).toEqual({ convId: "p_1_2", fromSeq: 1002, toSeq: 1002 });
+    useChatStore.getState().applyPulledMsgs(pullResp({ convId: "p_1_2", fromSeq: 1002, toSeq: 1002, msgs: [wsMsg({ convId: "p_1_2", seq: 1002, fromId: 2 })] }), 1);
+    expect(useChatStore.getState().messagesByConversation["p_1_2"].map((item) => item.seq)).toEqual([12, 1001, 1002]);
+  });
+
+  it("supplements an empty persisted window and ignores another user's history response", () => {
+    useChatStore.getState().initializeLive(1);
+    useChatStore.getState().applyConvSync([convView({ convId: "p_1_2", maxSeq: 1001 })]);
+    expect(useChatStore.getState().applyInitialHistory("p_1_2", [], false, 1)).toEqual({ convId: "p_1_2", fromSeq: 1, toSeq: 1001 });
+    useChatStore.getState().initializeLive(2);
+    expect(useChatStore.getState().applyInitialHistory("p_1_2", [wsMsg({ convId: "p_1_2", seq: 1001, fromId: 2 })], false, 1)).toBeNull();
+    expect(useChatStore.getState().messagesByConversation).toEqual({});
   });
 
   it("only pulls the missing range after reconnecting", () => {
@@ -89,6 +121,17 @@ describe("chat message state", () => {
 
     const pulls = useChatStore.getState().applyConvSync([convView({ convId: "p_1_2", maxSeq: 5 })]);
     expect(pulls).toEqual([{ convId: "p_1_2", fromSeq: 4, toSeq: 5 }]);
+  });
+
+  it("keeps a history cursor even when the entire page contains hidden revoke notices", () => {
+    useChatStore.getState().initializeLive(1);
+    useChatStore.getState().applyConvSync([convView({ convId: "p_1_2", maxSeq: 1002 })]);
+    const notice = (seq: number) => wsMsg({ convId: "p_1_2", seq, fromId: 2, msgType: 6, content: JSON.stringify({ targetSeq: seq - 1000, targetMsgId: String(seq), operatorId: 2 }) });
+    useChatStore.getState().applyInitialHistory("p_1_2", [notice(1001), notice(1002)], true, 1);
+    expect(useChatStore.getState().messagesByConversation["p_1_2"]).toEqual([]);
+    expect(useChatStore.getState().historyBeforeSeq["p_1_2"]).toBe(1001);
+    useChatStore.getState().prependHistory("p_1_2", [notice(1000)], true, 1);
+    expect(useChatStore.getState().historyBeforeSeq["p_1_2"]).toBe(1000);
   });
 
   it("deduplicates pulled and pushed messages by seq", () => {

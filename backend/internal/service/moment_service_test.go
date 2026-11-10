@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/goim/goim/internal/model"
+	"github.com/goim/goim/internal/repository"
 )
 
 // ── 模拟实现 ──
@@ -20,6 +21,7 @@ import (
 // 仅实现动态相关方法；其他方法会触发 panic。
 type mockMySQLRepo struct {
 	moments     map[int64]*model.Moment
+	outbox      []model.Moment
 	likes       map[string]*model.MomentLike // 键："momentID:userID"
 	comments    map[int64]*model.MomentComment
 	friends     map[int64][]int64 // userID -> friendID 列表
@@ -45,6 +47,14 @@ func (m *mockMySQLRepo) CreateMoment(ctx context.Context, moment *model.Moment) 
 	moment.ID = m.nextID
 	m.nextID++
 	m.moments[moment.ID] = moment
+	return nil
+}
+
+func (m *mockMySQLRepo) CreateMomentWithOutbox(ctx context.Context, moment *model.Moment) error {
+	if err := m.CreateMoment(ctx, moment); err != nil {
+		return err
+	}
+	m.outbox = append(m.outbox, *moment)
 	return nil
 }
 
@@ -108,33 +118,43 @@ func (m *mockMySQLRepo) CountFriends(_ context.Context, userID int64) (int, erro
 	return m.friendCount[userID], nil
 }
 
-// GetMomentLikers 返回该动态的全部点赞用户ID（用于 warm-up 回源）。
-func (m *mockMySQLRepo) GetMomentLikers(_ context.Context, momentID int64) ([]int64, error) {
-	prefix := fmt.Sprintf("%d:", momentID)
-	var ids []int64
-	for k, _ := range m.likes {
-		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
-			ids = append(ids, m.likes[k].UserID)
-		}
+func (m *mockMySQLRepo) SetMomentLike(ctx context.Context, momentID, userID int64, liked bool) (int64, error) {
+	if m.moments[momentID] == nil {
+		return 0, repository.ErrMomentNotFound
 	}
-	return ids, nil
+	key := fmt.Sprintf("%d:%d", momentID, userID)
+	if liked {
+		m.likes[key] = &model.MomentLike{MomentID: momentID, UserID: userID}
+	} else {
+		delete(m.likes, key)
+	}
+	stats, err := m.GetMomentLikeStats(ctx, userID, []int64{momentID})
+	return stats[momentID].LikeCount, err
 }
 
-func (m *mockMySQLRepo) BatchUpsertMomentLikes(_ context.Context, likes []model.MomentLike) error {
-	for _, l := range likes {
-		key := fmt.Sprintf("%d:%d", l.MomentID, l.UserID)
-		if _, exists := m.likes[key]; !exists {
-			m.likes[key] = &model.MomentLike{MomentID: l.MomentID, UserID: l.UserID, CreatedAt: l.CreatedAt}
+func (m *mockMySQLRepo) GetMomentLikeStats(_ context.Context, viewerID int64, momentIDs []int64) (map[int64]repository.MomentLikeStats, error) {
+	stats := make(map[int64]repository.MomentLikeStats, len(momentIDs))
+	for _, id := range momentIDs {
+		stats[id] = repository.MomentLikeStats{MomentID: id}
+	}
+	for _, like := range m.likes {
+		if stat, ok := stats[like.MomentID]; ok {
+			stat.LikeCount++
+			stat.LikedByMe = stat.LikedByMe || like.UserID == viewerID
+			stats[like.MomentID] = stat
 		}
 	}
-	return nil
+	return stats, nil
 }
 
-func (m *mockMySQLRepo) BatchDeleteMomentLikes(_ context.Context, keys []model.MomentLikeKey) error {
-	for _, k := range keys {
-		delete(m.likes, fmt.Sprintf("%d:%d", k.MomentID, k.UserID))
+func (m *mockMySQLRepo) ListMomentLikerProfiles(_ context.Context, momentID int64) ([]model.MomentLiker, error) {
+	likers := make([]model.MomentLiker, 0)
+	for _, like := range m.likes {
+		if user := m.users[like.UserID]; like.MomentID == momentID && user != nil {
+			likers = append(likers, model.MomentLiker{UserID: user.ID, Username: user.Username, AvatarURL: user.AvatarURL})
+		}
 	}
-	return nil
+	return likers, nil
 }
 
 func (m *mockMySQLRepo) CreateMomentComment(ctx context.Context, comment *model.MomentComment) error {
@@ -274,22 +294,16 @@ func (m *mockMySQLRepo) CreateOrUpdateUserSettings(_ context.Context, _ *model.U
 // momentMockRedisRepo 为动态测试实现 repository.RedisRepo。
 // 仅实现动态信息流方法；其他方法会触发 panic。
 type momentMockRedisRepo struct {
-	timelines  map[int64][]model.FeedEntry // userID -> 收件箱条目
-	outboxes   map[int64][]model.FeedEntry // userID -> 寄件箱条目
-	bigUsers   map[int64]bool
-	likeLoaded map[int64]bool           // momentID -> 是否已预热
-	likeSets   map[int64]map[int64]bool // momentID -> set of userIDs
-	likeCounts map[int64]int64          // momentID -> count
+	timelines map[int64][]model.FeedEntry // userID -> 收件箱条目
+	outboxes  map[int64][]model.FeedEntry // userID -> 寄件箱条目
+	bigUsers  map[int64]bool
 }
 
 func newMomentMockRedisRepo() *momentMockRedisRepo {
 	return &momentMockRedisRepo{
-		timelines:  make(map[int64][]model.FeedEntry),
-		outboxes:   make(map[int64][]model.FeedEntry),
-		bigUsers:   make(map[int64]bool),
-		likeLoaded: make(map[int64]bool),
-		likeSets:   make(map[int64]map[int64]bool),
-		likeCounts: make(map[int64]int64),
+		timelines: make(map[int64][]model.FeedEntry),
+		outboxes:  make(map[int64][]model.FeedEntry),
+		bigUsers:  make(map[int64]bool),
 	}
 }
 
@@ -343,86 +357,6 @@ func (m *momentMockRedisRepo) GetTimelinePage(_ context.Context, userID int64, m
 
 func (m *momentMockRedisRepo) GetOutboxPage(_ context.Context, userID int64, maxTs int64, maxID int64, limit int) ([]model.FeedEntry, error) {
 	return pageOf(m.outboxes[userID], maxTs, maxID, limit), nil
-}
-
-// ── 高并发点赞方法（有状态 mock）──
-
-func (m *momentMockRedisRepo) LikeMomentAtomic(_ context.Context, momentID, userID int64) (bool, int64, error) {
-	set := m.likeSets[momentID]
-	if set == nil {
-		set = make(map[int64]bool)
-		m.likeSets[momentID] = set
-	}
-	if set[userID] {
-		return false, m.likeCounts[momentID], nil // 已赞，幂等
-	}
-	set[userID] = true
-	m.likeCounts[momentID]++
-	return true, m.likeCounts[momentID], nil
-}
-
-func (m *momentMockRedisRepo) UnlikeMomentAtomic(_ context.Context, momentID, userID int64) (bool, int64, error) {
-	set := m.likeSets[momentID]
-	if set == nil || !set[userID] {
-		return false, m.likeCounts[momentID], nil // 未赞，幂等
-	}
-	delete(set, userID)
-	c := m.likeCounts[momentID] - 1
-	if c < 0 {
-		c = 0
-	}
-	m.likeCounts[momentID] = c
-	return true, c, nil
-}
-
-func (m *momentMockRedisRepo) EnsureMomentLikesLoaded(_ context.Context, momentID int64, loader func(context.Context) ([]int64, error), _ time.Duration) error {
-	if m.likeLoaded[momentID] {
-		return nil
-	}
-	m.likeLoaded[momentID] = true
-	if m.likeSets[momentID] == nil {
-		m.likeSets[momentID] = make(map[int64]bool)
-	}
-	// 如果 loader 能拉取到数据，载入（模拟 warm-up）
-	if loader != nil {
-		ids, err := loader(context.Background())
-		if err != nil {
-			return err
-		}
-		for _, uid := range ids {
-			m.likeSets[momentID][uid] = true
-		}
-		m.likeCounts[momentID] = int64(len(ids))
-	}
-	return nil
-}
-
-func (m *momentMockRedisRepo) GetMomentLikeStats(_ context.Context, viewerID int64, momentIDs []int64) (map[int64]int64, map[int64]bool, error) {
-	counts := make(map[int64]int64, len(momentIDs))
-	liked := make(map[int64]bool, len(momentIDs))
-	for _, mid := range momentIDs {
-		counts[mid] = m.likeCounts[mid]
-		if set := m.likeSets[mid]; set != nil {
-			liked[mid] = set[viewerID]
-		}
-	}
-	return counts, liked, nil
-}
-
-func (m *momentMockRedisRepo) GetMomentLikerIDs(_ context.Context, momentID int64) ([]int64, error) {
-	set := m.likeSets[momentID]
-	ids := make([]int64, 0, len(set))
-	for id := range set {
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
-func (m *momentMockRedisRepo) DeleteMomentLikes(_ context.Context, momentID int64) error {
-	delete(m.likeSets, momentID)
-	delete(m.likeCounts, momentID)
-	delete(m.likeLoaded, momentID)
-	return nil
 }
 
 // pageOf 模拟 getFeedPage 的契约：按 (ts,id) 降序，返回"严格早于游标 (maxTs,maxID)"的前 limit 条。
@@ -509,38 +443,14 @@ func (m *momentMockRedisRepo) RemoveGroupMemberRedis(_ context.Context, _ int64,
 }
 func (m *momentMockRedisRepo) SetFriendCache(_ context.Context, _ int64, _ int64) error { return nil }
 
-// momentMockMQRepo 为动态测试实现 repository.MQRepo。
-type momentMockMQRepo struct {
-	publishedMoments []*model.Moment
-	likeEvents       []*model.LikeEvent
-}
-
-func newMomentMockMQRepo() *momentMockMQRepo {
-	return &momentMockMQRepo{
-		publishedMoments: make([]*model.Moment, 0),
-		likeEvents:       make([]*model.LikeEvent, 0),
-	}
-}
-
-func (m *momentMockMQRepo) PublishMomentPush(_ context.Context, moment *model.Moment) error {
-	m.publishedMoments = append(m.publishedMoments, moment)
-	return nil
-}
-
-func (m *momentMockMQRepo) PublishLikeEvent(_ context.Context, evt *model.LikeEvent) error {
-	m.likeEvents = append(m.likeEvents, evt)
-	return nil
-}
-
 // ── 测试 ──
 
 func TestPublishMoment_Success(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	momentID, err := svc.PublishMoment(context.Background(), 100, "Hello world!", nil, 2)
 	assert.NoError(t, err)
@@ -553,18 +463,15 @@ func TestPublishMoment_Success(t *testing.T) {
 	assert.Equal(t, "Hello world!", moment.Content)
 	assert.Equal(t, 2, moment.Visibility)
 
-	// 验证动态已发布到 MQ
-	assert.Len(t, mqRepo.publishedMoments, 1)
-	assert.Equal(t, momentID, mqRepo.publishedMoments[0].ID)
+	assert.Equal(t, []model.Moment{*moment}, mysqlRepo.outbox)
 }
 
 func TestPublishMoment_EmptyContent(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	_, err := svc.PublishMoment(context.Background(), 100, "", nil, 2)
 	assert.Error(t, err)
@@ -573,7 +480,7 @@ func TestPublishMoment_EmptyContent(t *testing.T) {
 
 func TestPublishMoment_WhitespaceAndOverlongContent(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
-	svc := NewMomentService(mysqlRepo, newMomentMockRedisRepo(), newMomentMockMQRepo(), zap.NewNop(), time.Hour)
+	svc := NewMomentService(mysqlRepo, newMomentMockRedisRepo(), zap.NewNop())
 
 	_, err := svc.PublishMoment(context.Background(), 100, " \n\t ", nil, 2)
 	assert.EqualError(t, err, ErrMomentContentEmpty)
@@ -586,10 +493,9 @@ func TestPublishMoment_WhitespaceAndOverlongContent(t *testing.T) {
 func TestPublishMoment_InvalidVisibility(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	_, err := svc.PublishMoment(context.Background(), 100, "Hello", nil, 4)
 	assert.Error(t, err)
@@ -599,7 +505,6 @@ func TestPublishMoment_InvalidVisibility(t *testing.T) {
 func TestGetMoment_Success(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态
@@ -610,7 +515,7 @@ func TestGetMoment_Success(t *testing.T) {
 		CreatedAt:  time.Now(),
 	})
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	moment, err := svc.GetMoment(context.Background(), 100, 1)
 	assert.NoError(t, err)
@@ -625,10 +530,9 @@ func TestGetMoment_Success(t *testing.T) {
 func TestGetMoment_NotFound(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	moment, err := svc.GetMoment(context.Background(), 100, 999)
 	assert.Error(t, err)
@@ -639,9 +543,8 @@ func TestGetMoment_NotFound(t *testing.T) {
 func TestGetMoment_Visibility(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	mysqlRepo.CreateMoment(context.Background(), &model.Moment{AuthorID: 100, Content: "public", Visibility: 1, CreatedAt: time.Now()})
 	mysqlRepo.CreateMoment(context.Background(), &model.Moment{AuthorID: 100, Content: "friends", Visibility: 2, CreatedAt: time.Now()})
@@ -670,9 +573,8 @@ func TestGetMoment_Visibility(t *testing.T) {
 func TestGetUserMoments_FiltersBeforePagination(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	// 非好友看不到任何动态；好友可见动态参与分页，私密动态不能占用名额。
 	mysqlRepo.CreateMoment(context.Background(), &model.Moment{AuthorID: 100, Content: "public-1", Visibility: 1, CreatedAt: time.Now()})
@@ -696,7 +598,6 @@ func TestGetUserMoments_FiltersBeforePagination(t *testing.T) {
 func TestLikeMoment_Success(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态
@@ -708,26 +609,21 @@ func TestLikeMoment_Success(t *testing.T) {
 	})
 	mysqlRepo.friends[200] = []int64{100}
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	count, err := svc.LikeMoment(context.Background(), 200, 1)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), count)
 
-	// 验证 MQ 事件已发布
-	assert.Len(t, mqRepo.likeEvents, 1)
-	assert.Equal(t, model.LikeActionLike, mqRepo.likeEvents[0].Action)
-	assert.Equal(t, int64(200), mqRepo.likeEvents[0].UserID)
-	assert.Equal(t, int64(1), mqRepo.likeEvents[0].MomentID)
+	assert.Contains(t, mysqlRepo.likes, "1:200")
 }
 
 func TestLikeMoment_MomentNotFound(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	_, err := svc.LikeMoment(context.Background(), 200, 999)
 	assert.Error(t, err)
@@ -737,7 +633,6 @@ func TestLikeMoment_MomentNotFound(t *testing.T) {
 func TestLikeMoment_Idempotent(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态
@@ -749,7 +644,7 @@ func TestLikeMoment_Idempotent(t *testing.T) {
 	})
 	mysqlRepo.friends[200] = []int64{100}
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	// 第一次点赞成功，count=1
 	count1, err := svc.LikeMoment(context.Background(), 200, 1)
@@ -761,14 +656,12 @@ func TestLikeMoment_Idempotent(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, int64(1), count2)
 
-	// 只有第一次产生持久化事件
-	assert.Len(t, mqRepo.likeEvents, 1)
+	assert.Len(t, mysqlRepo.likes, 1)
 }
 
 func TestUnlikeMoment_Success(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态及其点赞明细（MySQL 侧已有历史赞）
@@ -778,25 +671,41 @@ func TestUnlikeMoment_Success(t *testing.T) {
 		Visibility: 1,
 		CreatedAt:  time.Now(),
 	})
-	mysqlRepo.BatchUpsertMomentLikes(context.Background(), []model.MomentLike{
-		{MomentID: 1, UserID: 200, CreatedAt: time.Now()},
-	})
+	mysqlRepo.friends[200] = []int64{100}
+	mysqlRepo.likes["1:200"] = &model.MomentLike{MomentID: 1, UserID: 200}
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	count, err := svc.UnlikeMoment(context.Background(), 200, 1)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), count) // 1→0
 
-	// 验证 MQ 事件已发布
-	assert.Len(t, mqRepo.likeEvents, 1)
-	assert.Equal(t, model.LikeActionUnlike, mqRepo.likeEvents[0].Action)
+	count, err = svc.UnlikeMoment(context.Background(), 200, 1)
+	assert.NoError(t, err)
+	assert.Zero(t, count)
+	assert.Empty(t, mysqlRepo.likes)
 }
 
-func TestGetMomentLikers_ReturnsCurrentRedisLikes(t *testing.T) {
+func TestMomentLikeMutationsRequireVisibility(t *testing.T) {
+	ctx := context.Background()
+	mysqlRepo := newMockMySQLRepo()
+	svc := NewMomentService(mysqlRepo, nil, zap.NewNop())
+	moment := &model.Moment{AuthorID: 100, Visibility: 3}
+	assert.NoError(t, mysqlRepo.CreateMoment(ctx, moment))
+	mysqlRepo.friends[200] = []int64{100}
+	mysqlRepo.likes["1:200"] = &model.MomentLike{MomentID: moment.ID, UserID: 200}
+
+	_, err := svc.LikeMoment(ctx, 200, moment.ID)
+	assert.EqualError(t, err, ErrMomentNotFound)
+	_, err = svc.UnlikeMoment(ctx, 200, moment.ID)
+	assert.EqualError(t, err, ErrMomentNotFound)
+	assert.Contains(t, mysqlRepo.likes, "1:200")
+}
+
+func TestGetMomentLikers_ReturnsCommittedLikes(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	svc := NewMomentService(mysqlRepo, redisRepo, newMomentMockMQRepo(), zap.NewNop(), time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, zap.NewNop())
 	moment := &model.Moment{AuthorID: 100, Content: "hello", Visibility: 2, CreatedAt: time.Now()}
 	assert.NoError(t, mysqlRepo.CreateMoment(context.Background(), moment))
 	mysqlRepo.friends[100] = []int64{200}
@@ -812,7 +721,7 @@ func TestGetMomentLikers_ReturnsCurrentRedisLikes(t *testing.T) {
 func TestDeleteMoment_OnlyAllowsAuthor(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	svc := NewMomentService(mysqlRepo, redisRepo, newMomentMockMQRepo(), zap.NewNop(), time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, zap.NewNop())
 	moment := &model.Moment{AuthorID: 100, Content: "delete me", Visibility: 2, CreatedAt: time.Now()}
 	assert.NoError(t, mysqlRepo.CreateMoment(context.Background(), moment))
 
@@ -827,7 +736,6 @@ func TestDeleteMoment_OnlyAllowsAuthor(t *testing.T) {
 func TestCommentMoment_Success(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态
@@ -839,7 +747,7 @@ func TestCommentMoment_Success(t *testing.T) {
 	})
 	mysqlRepo.friends[200] = []int64{100}
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	commentID, err := svc.CommentMoment(context.Background(), 200, 1, "Great post!")
 	assert.NoError(t, err)
@@ -856,10 +764,9 @@ func TestCommentMoment_Success(t *testing.T) {
 func TestCommentMoment_MomentNotFound(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	_, err := svc.CommentMoment(context.Background(), 200, 999, "comment")
 	assert.Error(t, err)
@@ -869,7 +776,6 @@ func TestCommentMoment_MomentNotFound(t *testing.T) {
 func TestCommentMoment_EmptyContent(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态
@@ -880,7 +786,7 @@ func TestCommentMoment_EmptyContent(t *testing.T) {
 		CreatedAt:  time.Now(),
 	})
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	_, err := svc.CommentMoment(context.Background(), 200, 1, "")
 	assert.Error(t, err)
@@ -890,7 +796,6 @@ func TestCommentMoment_EmptyContent(t *testing.T) {
 func TestDeleteComment_OwnershipValidation(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态和用户 200 的评论
@@ -909,7 +814,7 @@ func TestDeleteComment_OwnershipValidation(t *testing.T) {
 		CreatedAt: time.Now(),
 	})
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	// 用户 200（所有者）应该能够删除自己的评论
 	err := svc.DeleteComment(context.Background(), 200, commentID)
@@ -923,7 +828,6 @@ func TestDeleteComment_OwnershipValidation(t *testing.T) {
 func TestDeleteComment_NotOwner(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充一条动态和用户 200 的评论
@@ -942,7 +846,7 @@ func TestDeleteComment_NotOwner(t *testing.T) {
 		CreatedAt: time.Now(),
 	})
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	// 用户 300（非所有者）不应能够删除用户 200 的评论
 	err := svc.DeleteComment(context.Background(), 300, commentID)
@@ -957,10 +861,9 @@ func TestDeleteComment_NotOwner(t *testing.T) {
 func TestDeleteComment_NotFound(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	err := svc.DeleteComment(context.Background(), 200, 9999999)
 	assert.Error(t, err)
@@ -970,7 +873,6 @@ func TestDeleteComment_NotFound(t *testing.T) {
 func TestGetFeed_Success(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	// 预填充动态
@@ -983,7 +885,7 @@ func TestGetFeed_Success(t *testing.T) {
 	redisRepo.PublishMomentFeed(context.Background(), 200, 1, base+1)
 	redisRepo.PublishMomentFeed(context.Background(), 200, 2, base+2)
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	moments, next, err := svc.GetFeed(context.Background(), 200, "", 10)
 	assert.NoError(t, err)
@@ -997,10 +899,9 @@ func TestGetFeed_Success(t *testing.T) {
 func TestGetFeed_Empty(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	moments, next, err := svc.GetFeed(context.Background(), 200, "", 10)
 	assert.NoError(t, err)
@@ -1012,7 +913,6 @@ func TestGetFeed_Empty(t *testing.T) {
 func TestGetFeed_Hybrid(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	base := time.Now().UnixMilli()
@@ -1028,7 +928,7 @@ func TestGetFeed_Hybrid(t *testing.T) {
 	redisRepo.PublishMomentFeed(context.Background(), 200, 2, base+2) // 普通好友推入收件箱
 	redisRepo.AddToOutbox(context.Background(), 300, 3, base+3, 0)    // 大V好友寄件箱（拉取）
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	moments, _, err := svc.GetFeed(context.Background(), 200, "", 10)
 	assert.NoError(t, err)
@@ -1043,7 +943,6 @@ func TestGetFeed_Hybrid(t *testing.T) {
 func TestGetFeed_CursorPagination(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	base := time.Now().UnixMilli()
@@ -1054,7 +953,7 @@ func TestGetFeed_CursorPagination(t *testing.T) {
 	}
 	mysqlRepo.friends[200] = []int64{100}
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	// 第一页：limit=2 → 应返回 id 5,4，且有 next_cursor
 	page1, next1, err := svc.GetFeed(context.Background(), 200, "", 2)
@@ -1084,7 +983,6 @@ func TestGetFeed_CursorPagination(t *testing.T) {
 func TestGetFeed_PrivateFiltered(t *testing.T) {
 	mysqlRepo := newMockMySQLRepo()
 	redisRepo := newMomentMockRedisRepo()
-	mqRepo := newMomentMockMQRepo()
 	logger, _ := zap.NewDevelopment()
 
 	base := time.Now().UnixMilli()
@@ -1097,7 +995,7 @@ func TestGetFeed_PrivateFiltered(t *testing.T) {
 	redisRepo.AddToOutbox(context.Background(), 300, 1, base+1, 0)
 	redisRepo.AddToOutbox(context.Background(), 300, 2, base+2, 0)
 
-	svc := NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Hour)
+	svc := NewMomentService(mysqlRepo, redisRepo, logger)
 
 	moments, _, err := svc.GetFeed(context.Background(), 200, "", 10)
 	assert.NoError(t, err)

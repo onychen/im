@@ -17,33 +17,27 @@ import (
 // ── Topic 名称 ──
 const (
 	// TopicMsg 承载所有聊天消息（私聊、群聊、撤回通知），按 convId 分区保证同会话有序。
-	// 写入成功（acks=all）即为消息提交点；persist 与 deliver 两个消费者组各自独立消费。
-	TopicMsg         = "msg_topic"
-	TopicMomentPush  = "moment_push"
-	TopicLikePersist = "like_persist"
+	// 写入成功（acks=all）即为接收确认；msg-persist 逐条落库后投递。
+	TopicMsg        = "msg_topic"
+	TopicMomentPush = "moment_push"
 
 	// 死信 Topic：消费者重试达到上限后转投，保留原消息与失败原因供人工排查/回放。
-	TopicMsgDLQ         = "msg_topic_dlq"
-	TopicMomentPushDLQ  = "moment_push_dlq"
-	TopicLikePersistDLQ = "like_persist_dlq"
+	TopicMsgDLQ        = "msg_topic_dlq"
+	TopicMomentPushDLQ = "moment_push_dlq"
 )
 
 // TopicNames 列出 IM 系统所需的所有 Topic。
 var TopicNames = []string{
 	TopicMsg,
 	TopicMomentPush,
-	TopicLikePersist,
 	TopicMsgDLQ,
 	TopicMomentPushDLQ,
-	TopicLikePersistDLQ,
 }
 
 // ── 消费者组名称（会拼接 config.Kafka.GroupPrefix）──
 const (
-	GroupMsgPersist   = "msg-persist"
-	GroupMsgDeliver   = "msg-deliver"
-	GroupMomentFeed   = "moment-feed"
-	GroupLikePersist  = "like-persist"
+	GroupMsgPersist = "msg-persist"
+	GroupMomentFeed = "moment-feed"
 )
 
 // KafkaClient 封装 broker 地址与 Dialer，负责创建 Writer / Reader 以及运维类操作。

@@ -28,10 +28,10 @@ type Friendship struct {
 	ID        int64     `json:"id"`
 	UserID    int64     `json:"user_id"`
 	FriendID  int64     `json:"friend_id"`
-	Nickname  string    `json:"nickname,omitempty"`
-	AvatarURL string    `json:"avatar_url,omitempty"`
-	Online    bool      `json:"online"`
-	IsBlocked bool      `json:"is_blocked"`
+	Nickname  string    `json:"nickname,omitempty" gorm:"-"`
+	AvatarURL string    `json:"avatar_url,omitempty" gorm:"-"`
+	Online    bool      `json:"online" gorm:"-"`
+	IsBlocked bool      `json:"is_blocked" gorm:"-"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -41,3 +41,5 @@ type Blacklist struct {
 	BlockedID int64     `json:"blocked_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+func (Blacklist) TableName() string { return "blacklist" }

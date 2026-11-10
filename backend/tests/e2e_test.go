@@ -11,7 +11,6 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +27,7 @@ import (
 	goredisv9 "github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 
 	"github.com/goim/goim/internal/api"
 	"github.com/goim/goim/internal/config"
@@ -36,7 +36,6 @@ import (
 	"github.com/goim/goim/internal/idgen"
 	"github.com/goim/goim/internal/infra"
 	"github.com/goim/goim/internal/middleware"
-	goredis "github.com/goim/goim/internal/redis"
 	"github.com/goim/goim/internal/repository"
 	"github.com/goim/goim/internal/service"
 	"github.com/goim/goim/internal/ws"
@@ -48,13 +47,13 @@ import (
 
 // testEnv 保存完整的测试环境：服务器、连接、基础 URL。
 type testEnv struct {
-	baseURL string
-	db      *sql.DB
-	rdb     *goredisv9.Client
+	baseURL  string
+	db       *gorm.DB
+	rdb      *goredisv9.Client
 	mqWriter *kafka.Writer
-	logger  *zap.Logger
-	server  *httptest.Server
-	cancel  context.CancelFunc
+	logger   *zap.Logger
+	server   *httptest.Server
+	cancel   context.CancelFunc
 }
 
 var env *testEnv
@@ -99,7 +98,12 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "连接 MySQL: %v\n", err)
 		os.Exit(1)
 	}
-	if err := db.Ping(); err != nil {
+	sqlDB, err := db.DB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "获取 MySQL 连接池: %v\n", err)
+		os.Exit(1)
+	}
+	if err := sqlDB.Ping(); err != nil {
 		fmt.Fprintf(os.Stderr, "MySQL 连通检测: %v\n", err)
 		os.Exit(1)
 	}
@@ -131,12 +135,7 @@ func TestMain(m *testing.M) {
 	kafkaInitCancel()
 	logger.Info("Kafka 已连接，准备 E2E 测试")
 
-	// ── 加载 Lua 脚本 ──
 	ctx := context.Background()
-	if err := goredis.LoadLuaScripts(rdb, ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "加载 Lua 脚本: %v\n", err)
-		os.Exit(1)
-	}
 
 	// ── 构建仓库层 ──
 	mysqlRepo := repository.NewMySQLRepo(db)
@@ -160,7 +159,7 @@ func TestMain(m *testing.M) {
 	authSvc := service.NewAuthService(mysqlRepo, cfg.JWT.Secret, cfg.JWT.AccessExpHours, cfg.JWT.RefreshExpDays)
 	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations)
 	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations, msgSvc)
-	momentSvc := service.NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Duration(cfg.Moment.LikeCacheTTLHours)*time.Hour)
+	momentSvc := service.NewMomentService(mysqlRepo, redisRepo, logger)
 	settingsSvc := service.NewSettingsService(mysqlRepo, logger)
 
 	// ── 构建 WS 消息分发器 ──
@@ -191,11 +190,7 @@ func TestMain(m *testing.M) {
 	}
 	persistConsumer := consumer.NewMsgPersistConsumer(
 		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgPersist),
-		mysqlRepo, logger, cfg.Message.PersistBatchSize, cfg.Message.PersistFlushMs,
-	).WithDeadLetter(msgDLQ)
-	deliverConsumer := consumer.NewMsgDeliverConsumer(
-		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgDeliver),
-		msgSvc, logger,
+		mysqlRepo, msgSvc, logger,
 	).WithDeadLetter(msgDLQ)
 	momentFeedConsumer := consumer.NewMomentFeedConsumer(kafkaClient.NewReader(infra.TopicMomentPush, infra.GroupMomentFeed), mysqlRepo, redisRepo, logger, cfg.Moment.BigUserFriendThreshold, cfg.Moment.TimelineMaxLen)
 
@@ -203,14 +198,11 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "启动消息落库消费者: %v\n", err)
 		os.Exit(1)
 	}
-	if err := deliverConsumer.Start(consumerCtx); err != nil {
-		fmt.Fprintf(os.Stderr, "启动消息投递消费者: %v\n", err)
-		os.Exit(1)
-	}
 	if err := momentFeedConsumer.Start(consumerCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "启动动态流消费者: %v\n", err)
 		os.Exit(1)
 	}
+	relayDone := consumer.StartMomentOutboxRelay(consumerCtx, mysqlRepo, mqRepo.PublishMomentPush, logger)
 	logger.Info("MQ 消费者已启动，准备 E2E 测试")
 
 	// ── 启动清理任务 ──
@@ -220,13 +212,13 @@ func TestMain(m *testing.M) {
 	server := httptest.NewServer(router)
 
 	env = &testEnv{
-		baseURL: server.URL,
-		db:      db,
-		rdb:     rdb,
+		baseURL:  server.URL,
+		db:       db,
+		rdb:      rdb,
 		mqWriter: mqWriter,
-		logger:  logger,
-		server:  server,
-		cancel:  consumerCancel,
+		logger:   logger,
+		server:   server,
+		cancel:   consumerCancel,
 	}
 
 	logger.Info("GoIM E2E 服务器已启动", zap.String("url", env.baseURL))
@@ -236,11 +228,12 @@ func TestMain(m *testing.M) {
 
 	// ── 清理 ──
 	consumerCancel()
+	<-relayDone
 	server.Close()
 	os.RemoveAll(uploadDir)
 	mqWriter.Close()
 	rdb.Close()
-	db.Close()
+	sqlDB.Close()
 	logger.Sync()
 	os.Exit(code)
 }
@@ -620,6 +613,15 @@ func TestE2E_GroupMessaging(t *testing.T) {
 	if len(pulled) == 0 || pulled[len(pulled)-1].Content != "hello group from E2E" {
 		t.Fatalf("u2 补拉结果不符合预期: %+v", pulled)
 	}
+	for _, token := range []string{u2Token, u1Token} {
+		history := fetchHistory(t, token, groupConvID, 0, 1)
+		if len(history) != 1 || history[0].Seq != ackData.Seq || history[0].Content != "hello group from E2E" {
+			t.Fatalf("群历史首屏结果不符合预期: %+v", history)
+		}
+		if exists, err := env.rdb.Exists(context.Background(), "group_history:"+groupConvID).Result(); err != nil || exists != 1 {
+			t.Fatalf("群历史首屏应回填共享缓存: exists=%d err=%v", exists, err)
+		}
+	}
 }
 
 // TestE2E_PrivateMessaging 测试两个好友之间通过 WS 的私聊消息。
@@ -672,10 +674,14 @@ func TestE2E_PrivateMessaging(t *testing.T) {
 		t.Fatalf("私聊 serverAck 不符合预期: %+v", ackData)
 	}
 
-	// deliver 消费者把消息推给在线的 u2，seq 与 serverAck 一致
+	// 收到在线推送时，接收方立即能从历史接口读到同一条消息。
 	received := readPushedMsg(t, wsConn2, convID)
 	if received.Seq != ackData.Seq || received.MsgID != ackData.ServerMsgID || received.SenderID != u1ID {
 		t.Fatalf("u2 收到的消息与 serverAck 不一致: msg=%+v ack=%+v", received, ackData)
+	}
+	history := fetchHistory(t, u2Token, convID, 0, 1)
+	if len(history) != 1 || history[0].MsgID != received.MsgID || history[0].Seq != received.Seq {
+		t.Fatalf("在线推送时历史消息应已落库: msg=%+v history=%+v", received, history)
 	}
 
 	// u2 上报已读到该 seq，随后 convSync 中 unread 应为 0
@@ -737,12 +743,25 @@ func TestE2E_MomentFlow(t *testing.T) {
 		t.Fatalf("获取动态: status=%d body=%s", status, body)
 	}
 
+	waitUntil(t, 10*time.Second, "动态进入好友时间线", func() bool {
+		_, ok := getMomentFeedItems(t, u2Token)[momentID]
+		return ok
+	})
+	assertFeedLike := func(wantCount int64, wantLiked bool) {
+		t.Helper()
+		item, ok := getMomentFeedItems(t, u2Token)[momentID]
+		if !ok || item.LikeCount != wantCount || item.LikedByMe != wantLiked {
+			t.Fatalf("feed like state: got %+v (present=%v), want count=%d liked=%v", item, ok, wantCount, wantLiked)
+		}
+	}
+
 	// 步骤 3：点赞动态（u2）
 	status, body = doAuthedRequest(t, http.MethodPost, env.baseURL,
 		fmt.Sprintf("/api/v1/moment/%d/like", momentID), nil, u2Token)
 	if status != http.StatusOK {
 		t.Fatalf("点赞动态: status=%d body=%s", status, body)
 	}
+	assertFeedLike(1, true)
 
 	// 步骤 4：取消点赞动态（u2）
 	status, body = doAuthedRequest(t, http.MethodDelete, env.baseURL,
@@ -750,6 +769,7 @@ func TestE2E_MomentFlow(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("取消点赞动态: status=%d body=%s", status, body)
 	}
+	assertFeedLike(0, false)
 
 	// 步骤 5：评论（u2）
 	status, body = doAuthedRequest(t, http.MethodPost, env.baseURL,
@@ -764,16 +784,7 @@ func TestE2E_MomentFlow(t *testing.T) {
 	decodeSuccessResponse(t, body, &commentResp)
 	t.Logf("评论已添加: id=%d", commentResp.CommentID)
 
-	// 步骤 6：获取动态流（u2）—— 等待 MQ 消费者分发完成
-	time.Sleep(2 * time.Second)
-	status, body = doAuthedRequest(t, http.MethodGet, env.baseURL,
-		"/api/v1/moment/feed?limit=10", nil, u2Token)
-	if status != http.StatusOK {
-		t.Fatalf("获取动态流: status=%d body=%s", status, body)
-	}
-	t.Logf("u2 动态流: %s", body)
-
-	// 步骤 7：删除评论
+	// 步骤 6：删除评论
 	if commentResp.CommentID > 0 {
 		status, body = doAuthedRequest(t, http.MethodDelete, env.baseURL,
 			fmt.Sprintf("/api/v1/moment/comment/%d", commentResp.CommentID), nil, u2Token)
@@ -1084,27 +1095,37 @@ func TestE2E_MomentPrivacyAcrossReadEndpoints(t *testing.T) {
 		t.Fatalf("stranger list visibility mismatch: %+v", strangerIDs)
 	}
 
-	status, body = doAuthedRequest(t, http.MethodGet, env.baseURL, "/api/v1/moment/feed?limit=20", nil, friendToken)
+	waitUntil(t, 10*time.Second, "好友动态进入时间线", func() bool {
+		items := getMomentFeedItems(t, friendToken)
+		if _, ok := items[privateID]; ok {
+			t.Fatalf("friend feed exposed private moment %d", privateID)
+		}
+		_, ok := items[friendsID]
+		return ok
+	})
+}
+
+type momentFeedItem struct {
+	ID        int64 `json:"id"`
+	LikeCount int64 `json:"like_count"`
+	LikedByMe bool  `json:"liked_by_me"`
+}
+
+func getMomentFeedItems(t *testing.T, token string) map[int64]momentFeedItem {
+	t.Helper()
+	status, body := doAuthedRequest(t, http.MethodGet, env.baseURL, "/api/v1/moment/feed?limit=20", nil, token)
 	if status != http.StatusOK {
-		t.Fatalf("friend feed: status=%d body=%s", status, body)
+		t.Fatalf("get feed: status=%d body=%s", status, body)
 	}
 	var feed struct {
-		Data struct {
-			Moments []struct {
-				ID int64 `json:"id"`
-			} `json:"moments"`
-		} `json:"data"`
+		Moments []momentFeedItem `json:"moments"`
 	}
-	if err := json.Unmarshal(body, &feed); err != nil {
-		t.Fatalf("parse friend feed: %v", err)
+	decodeSuccessResponse(t, body, &feed)
+	items := make(map[int64]momentFeedItem, len(feed.Moments))
+	for _, item := range feed.Moments {
+		items[item.ID] = item
 	}
-	feedIDs := make(map[int64]bool)
-	for _, item := range feed.Data.Moments {
-		feedIDs[item.ID] = true
-	}
-	if !feedIDs[friendsID] || feedIDs[privateID] {
-		t.Fatalf("friend feed visibility mismatch: %+v", feedIDs)
-	}
+	return items
 }
 
 func TestE2E_MessageOperations(t *testing.T) {

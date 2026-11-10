@@ -36,6 +36,3 @@ file:
 moment:
   big_user_friend_threshold: 500
   timeline_max_len: 1000
-  like_persist_batch_size: 200
-  like_persist_flush_ms: 500
-  like_cache_ttl_hours: 168

@@ -8,14 +8,14 @@ import (
 )
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	MySQL    MySQLConfig    `yaml:"mysql"`
-	Redis    RedisConfig    `yaml:"redis"`
-	Kafka    KafkaConfig    `yaml:"kafka"`
-	JWT      JWTConfig      `yaml:"jwt"`
-	File     FileConfig     `yaml:"file"`
-	Moment   MomentConfig   `yaml:"moment"`
-	Message  MessageConfig  `yaml:"message"`
+	Server  ServerConfig  `yaml:"server"`
+	MySQL   MySQLConfig   `yaml:"mysql"`
+	Redis   RedisConfig   `yaml:"redis"`
+	Kafka   KafkaConfig   `yaml:"kafka"`
+	JWT     JWTConfig     `yaml:"jwt"`
+	File    FileConfig    `yaml:"file"`
+	Moment  MomentConfig  `yaml:"moment"`
+	Message MessageConfig `yaml:"message"`
 }
 
 type ServerConfig struct {
@@ -96,12 +96,10 @@ func splitAndTrim(raw string) []string {
 
 // MessageConfig 控制消息链路的参数。
 type MessageConfig struct {
+	// SeqSegmentSize 是每个会话一次预留的 seq 数量，默认 1000。仅支持单写入实例。
+	SeqSegmentSize int64 `yaml:"seq_segment_size"`
 	// NodeID 是雪花算法的机器号（0-1023），单机部署保持默认 0 即可。
 	NodeID int64 `yaml:"node_id"`
-	// PersistBatchSize 是消息落库消费者的攒批阈值。默认 200。
-	PersistBatchSize int `yaml:"persist_batch_size"`
-	// PersistFlushMs 是消息落库消费者的最大攒批间隔（毫秒）。默认 100。
-	PersistFlushMs int `yaml:"persist_flush_ms"`
 }
 
 type JWTConfig struct {
@@ -116,7 +114,7 @@ type FileConfig struct {
 	UploadDir   string   `yaml:"upload_dir"`
 }
 
-// MomentConfig 控制朋友圈 Feed 的推拉结合策略与点赞缓存/落库。
+// MomentConfig 控制朋友圈 Feed 的推拉结合策略。
 type MomentConfig struct {
 	// BigUserFriendThreshold 是"大V"判定的好友数阈值。
 	// 好友数 > 阈值的作者发布动态时不再写扩散到好友收件箱，
@@ -125,13 +123,6 @@ type MomentConfig struct {
 	// TimelineMaxLen 是每个用户收件箱/寄件箱 ZSet 的最大保留条数，
 	// 扇出后按此长度裁剪最旧的条目，防止无限膨胀。默认 1000。
 	TimelineMaxLen int `yaml:"timeline_max_len"`
-	// LikePersistBatchSize 是点赞落库消费者的攒批阈值（攒够即 flush）。默认 200。
-	LikePersistBatchSize int `yaml:"like_persist_batch_size"`
-	// LikePersistFlushMs 是点赞落库消费者的最大攒批间隔（毫秒）。默认 500。
-	LikePersistFlushMs int `yaml:"like_persist_flush_ms"`
-	// LikeCacheTTLHours 是点赞 Redis 缓存（集合/计数/预热标记）的 TTL（小时），
-	// 冷动态到期后自动淘汰、下次交互重新预热。默认 168（7 天）。
-	LikeCacheTTLHours int `yaml:"like_cache_ttl_hours"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -145,11 +136,8 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	// 消息链路默认值
-	if cfg.Message.PersistBatchSize <= 0 {
-		cfg.Message.PersistBatchSize = 200
-	}
-	if cfg.Message.PersistFlushMs <= 0 {
-		cfg.Message.PersistFlushMs = 100
+	if cfg.Message.SeqSegmentSize <= 0 {
+		cfg.Message.SeqSegmentSize = 1000
 	}
 
 	// Kafka 默认值（未配置时生效）
@@ -178,15 +166,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Moment.TimelineMaxLen <= 0 {
 		cfg.Moment.TimelineMaxLen = 1000
-	}
-	if cfg.Moment.LikePersistBatchSize <= 0 {
-		cfg.Moment.LikePersistBatchSize = 200
-	}
-	if cfg.Moment.LikePersistFlushMs <= 0 {
-		cfg.Moment.LikePersistFlushMs = 500
-	}
-	if cfg.Moment.LikeCacheTTLHours <= 0 {
-		cfg.Moment.LikeCacheTTLHours = 168
 	}
 
 	return &cfg, nil

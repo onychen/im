@@ -4,15 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/goim/goim/internal/model"
-	"github.com/goim/goim/internal/redis"
 )
 
-// RedisRepo 定义朋友圈、点赞等社交功能需要的 Redis 操作。
+// RedisRepo 定义朋友圈时间线需要的 Redis 操作。
 // 消息相关的缓存（seq 计数器、消息窗口、会话元数据、去重）在 MessageCache 中，
 // 好友与群成员的旁路缓存在 RelationCache 中。
 type RedisRepo interface {
@@ -33,24 +31,6 @@ type RedisRepo interface {
 	// maxTs<0 表示首页（从最新开始）。
 	GetTimelinePage(ctx context.Context, userID int64, maxTs int64, maxID int64, limit int) ([]model.FeedEntry, error)
 	GetOutboxPage(ctx context.Context, userID int64, maxTs int64, maxID int64, limit int) ([]model.FeedEntry, error)
-
-	// ── 朋友圈点赞（高并发）──
-	// LikeMomentAtomic 原子点赞：SADD 判重 + INCR 计数（单 Lua 脚本）。
-	// changed=true 表示本次为新增赞，count 为最新点赞数。
-	LikeMomentAtomic(ctx context.Context, momentID, userID int64) (changed bool, count int64, err error)
-	// UnlikeMomentAtomic 原子取消赞：SREM + DECR（计数不低于 0）。
-	UnlikeMomentAtomic(ctx context.Context, momentID, userID int64) (changed bool, count int64, err error)
-	// EnsureMomentLikesLoaded 确保点赞集合/计数已从持久层预热到 Redis。
-	// 通过 loaded 标记 + NX 锁防缓存击穿；冷 key 时调用 loader 从 MySQL 拉取全部点赞用户，
-	// 载入 Set 并置 count=len，四个 key 统一带 ttl。必须在任何点赞/读取操作前调用以保证计数正确。
-	EnsureMomentLikesLoaded(ctx context.Context, momentID int64, loader func(context.Context) ([]int64, error), ttl time.Duration) error
-	// GetMomentLikeStats 批量读取多条动态的点赞数与"viewer 是否已赞"（单次 pipeline）。
-	GetMomentLikeStats(ctx context.Context, viewerID int64, momentIDs []int64) (counts map[int64]int64, liked map[int64]bool, err error)
-	// GetMomentLikerIDs 返回当前 Redis 点赞集合中的全部用户 ID；调用前需先预热。
-	GetMomentLikerIDs(ctx context.Context, momentID int64) ([]int64, error)
-	// DeleteMomentLikes 清理删除动态遗留的点赞缓存。
-	DeleteMomentLikes(ctx context.Context, momentID int64) error
-
 }
 
 // ──────────────────────────────────────────────────────
@@ -251,139 +231,3 @@ func (r *RedisRepoImpl) zrevPage(ctx context.Context, key, max, min string, coun
 	}
 	return entries, nil
 }
-
-// ── 朋友圈点赞（高并发）──
-// 四个 key 集中管理，避免散落魔法字符串。
-func momentLikesKey(momentID int64) string     { return fmt.Sprintf("moment:likes:%d", momentID) }
-func momentLikeCountKey(momentID int64) string { return fmt.Sprintf("moment:like_count:%d", momentID) }
-func momentLikeLoadedKey(momentID int64) string {
-	return fmt.Sprintf("moment:like_loaded:%d", momentID)
-}
-func momentLikeLockKey(momentID int64) string { return fmt.Sprintf("moment:like_lock:%d", momentID) }
-
-func (r *RedisRepoImpl) LikeMomentAtomic(ctx context.Context, momentID, userID int64) (bool, int64, error) {
-	res, err := redis.ExecMomentLike(r.rdb, ctx, momentLikesKey(momentID), momentLikeCountKey(momentID), userID)
-	if err != nil {
-		return false, 0, fmt.Errorf("原子点赞: %w", err)
-	}
-	return res.Changed, res.Count, nil
-}
-
-func (r *RedisRepoImpl) UnlikeMomentAtomic(ctx context.Context, momentID, userID int64) (bool, int64, error) {
-	res, err := redis.ExecMomentUnlike(r.rdb, ctx, momentLikesKey(momentID), momentLikeCountKey(momentID), userID)
-	if err != nil {
-		return false, 0, fmt.Errorf("原子取消赞: %w", err)
-	}
-	return res.Changed, res.Count, nil
-}
-
-// EnsureMomentLikesLoaded 见接口注释。空点赞集合也会写入 count=0 + loaded 标记，避免反复回源。
-func (r *RedisRepoImpl) EnsureMomentLikesLoaded(ctx context.Context, momentID int64, loader func(context.Context) ([]int64, error), ttl time.Duration) error {
-	flagKey := momentLikeLoadedKey(momentID)
-	if ex, err := r.rdb.Exists(ctx, flagKey).Result(); err == nil && ex == 1 {
-		return nil // 已预热
-	}
-
-	// 抢 warm-up 锁，防缓存击穿（并发只有一个回源）。
-	lockKey := momentLikeLockKey(momentID)
-	got, err := r.rdb.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
-	if err != nil {
-		return fmt.Errorf("点赞预热抢锁: %w", err)
-	}
-	if !got {
-		// 他人正在预热：轮询 loaded 标记 ~200ms；仍未就绪则尽力而为返回（TTL 兜底，下次再预热）。
-		for i := 0; i < 20; i++ {
-			time.Sleep(10 * time.Millisecond)
-			if ex, _ := r.rdb.Exists(ctx, flagKey).Result(); ex == 1 {
-				return nil
-			}
-		}
-		return nil
-	}
-	defer r.rdb.Del(ctx, lockKey)
-
-	// 抢到锁后二次确认（可能在抢锁间隙已被别人预热完）。
-	if ex, _ := r.rdb.Exists(ctx, flagKey).Result(); ex == 1 {
-		return nil
-	}
-
-	likers, err := loader(ctx)
-	if err != nil {
-		return fmt.Errorf("点赞预热回源: %w", err)
-	}
-
-	setKey := momentLikesKey(momentID)
-	countKey := momentLikeCountKey(momentID)
-	pipe := r.rdb.Pipeline()
-	pipe.Del(ctx, setKey) // 清理残留，保证与 MySQL 一致
-	if len(likers) > 0 {
-		members := make([]interface{}, len(likers))
-		for i, id := range likers {
-			members[i] = id
-		}
-		pipe.SAdd(ctx, setKey, members...)
-		pipe.Expire(ctx, setKey, ttl)
-	}
-	pipe.Set(ctx, countKey, len(likers), ttl)
-	pipe.Set(ctx, flagKey, "1", ttl)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("点赞预热写入: %w", err)
-	}
-	return nil
-}
-
-// GetMomentLikeStats 单次 pipeline 读取每条动态的 count（GET）与 viewer 是否已赞（SISMEMBER）。
-// 缺失的 count 视为 0；调用方应先 EnsureMomentLikesLoaded 保证数据已预热。
-func (r *RedisRepoImpl) GetMomentLikeStats(ctx context.Context, viewerID int64, momentIDs []int64) (map[int64]int64, map[int64]bool, error) {
-	counts := make(map[int64]int64, len(momentIDs))
-	liked := make(map[int64]bool, len(momentIDs))
-	if len(momentIDs) == 0 {
-		return counts, liked, nil
-	}
-
-	pipe := r.rdb.Pipeline()
-	getCmds := make(map[int64]*goredis.StringCmd, len(momentIDs))
-	memCmds := make(map[int64]*goredis.BoolCmd, len(momentIDs))
-	viewer := strconv.FormatInt(viewerID, 10)
-	for _, id := range momentIDs {
-		getCmds[id] = pipe.Get(ctx, momentLikeCountKey(id))
-		memCmds[id] = pipe.SIsMember(ctx, momentLikesKey(id), viewer)
-	}
-	// GET 命中缺失 key 会返回 redis.Nil，pipeline 聚合错误也是 Nil；逐条解析时单独处理。
-	if _, err := pipe.Exec(ctx); err != nil && err != goredis.Nil {
-		return nil, nil, fmt.Errorf("批量读取点赞状态: %w", err)
-	}
-	for _, id := range momentIDs {
-		if v, err := getCmds[id].Int64(); err == nil {
-			counts[id] = v
-		} // 缺失/解析失败 → 保持 0
-		if m, err := memCmds[id].Result(); err == nil {
-			liked[id] = m
-		}
-	}
-	return counts, liked, nil
-}
-
-func (r *RedisRepoImpl) GetMomentLikerIDs(ctx context.Context, momentID int64) ([]int64, error) {
-	members, err := r.rdb.SMembers(ctx, momentLikesKey(momentID)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("读取点赞用户集合: %w", err)
-	}
-	ids := make([]int64, 0, len(members))
-	for _, member := range members {
-		id, err := strconv.ParseInt(member, 10, 64)
-		if err != nil {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
-func (r *RedisRepoImpl) DeleteMomentLikes(ctx context.Context, momentID int64) error {
-	if err := r.rdb.Del(ctx, momentLikesKey(momentID), momentLikeCountKey(momentID), momentLikeLoadedKey(momentID), momentLikeLockKey(momentID)).Err(); err != nil {
-		return fmt.Errorf("清理动态点赞缓存: %w", err)
-	}
-	return nil
-}
-

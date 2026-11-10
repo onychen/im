@@ -37,10 +37,28 @@ GoIM 是一个完整的 Web 即时通讯系统。前端提供面向用户的聊�
 | 前端状态 | Zustand · TanStack Query · React Router | 本地状态、服务端缓存与路由 |
 | 后端 | Go 1.24+ · Gin | REST API、鉴权、中间件与业务服务 |
 | 实时通信 | Gorilla WebSocket | 私聊、群聊与在线实时推送 |
-| 数据存储 | MySQL 8.4 | 用户、关系、消息、群组、动态等持久化数据 |
+| 数据存储 | MySQL 8.4 · GORM | 用户、关系、消息、群组、动态等持久化数据 |
 | 缓存 | Redis 7.2 · Lua | 会话、未读/已读、时间线及高频原子操作 |
-| 异步消息 | Kafka 3.7（KRaft）· segmentio/kafka-go | 消息持久化、动态分发、点赞异步落库 |
+| 异步消息 | Kafka 3.7（KRaft）· segmentio/kafka-go | 消息持久化、动态分发 |
 | 交付 | Docker Compose · GitHub Actions · GHCR | 本地依赖、CI/CD 与镜像发布 |
+
+后端通过 GORM 访问 MySQL，模型位于 `backend/internal/model/`，读写逻辑位于 `backend/internal/repository/`。消息与会话的数据库时间、可空字段由仓储内的存储模型转换，保持现有 API/Kafka 消息格式。表结构继续使用 `backend/scripts/migrations/` 中的 SQL 脚本管理。
+
+会话 seq 使用 `conversations.seq_alloc_max` 持久化预留号段，进程内取号；未读统计实际有效消息，首次加载按实际历史消息游标分页。已有数据库需要执行 `016_conversation_seq_segments.sql`，升级步骤与单写入实例约束见 [seq 号段与未读计数改造](docs/seq号段与未读计数改造.md)。
+
+朋友圈发布在同一个 MySQL 事务中写入动态和待分发事件。后台任务向 Kafka 投递并在确认后清理待发记录。已有数据库升级前需执行 [017_create_moment_outbox.sql](backend/scripts/migrations/017_create_moment_outbox.sql)。
+
+朋友圈点赞与取消赞提交到 `moment_likes` 后返回，Feed 批量从 MySQL 查询点赞数和当前用户的点赞状态。已有点赞表可直接使用。若从 Redis 先写、Kafka 异步落库的版本升级，先暂停旧版点赞和取消赞请求，等待在途请求结束，并让旧版 `like_persist` 消费组把所有分区的积压和已拉取批次提交完。确认消费组各分区 lag 为 0 后，停止旧实例，再启用新版写入。旧点赞主题中未确认的数据需要在切换前处理。
+
+群聊历史按群共享最近 200 条消息的 Redis 窗口，读取时以 MySQL 版本校验，缓存不足时回源。已有数据库启动新版服务前需执行 [018_group_history_version.sql](backend/scripts/migrations/018_group_history_version.sql)，并将消息落库消费者一并升级。
+
+GORM 仓储的 MySQL 集成测试会创建并清理临时数据库，需要提供具有建库权限的测试实例：
+
+```powershell
+Set-Location backend
+$env:GOIM_TEST_MYSQL_DSN = 'user:password@tcp(127.0.0.1:3306)/?charset=utf8mb4&parseTime=true'
+go test -tags integration ./internal/repository -count=1 -v
+```
 
 ## 项目结构
 
@@ -147,7 +165,6 @@ npm run dev
 | `private_msg_persist` | `goim-private-msg` | 会话 ID | 私聊持久化 |
 | `group_msg_fanout` | `goim-group-msg` | 群会话 ID | 群消息扇出 |
 | `moment_push` | `goim-moment-feed` | 作者 ID | 动态推送到好友时间线 |
-| `like_persist` | `goim-like-persist` | 动态 ID | 点赞批量落库 |
 | `comment_persist` | - | - | 预留（与原版一致，暂无消费者） |
 
 与 RabbitMQ 版本的语义差异：生产端 `RequiredAcks=all` 同步写入替代 publisher confirm；消费端同步提交 offset 替代 ack；处理失败在分区内退避重试（200ms 到 10s）替代 nack requeue；Kafka 客户端自动重连，服务不再因 MQ 断连主动退出，`/ready` 基于周期 Ping 判断。

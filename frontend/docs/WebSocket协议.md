@@ -8,9 +8,10 @@ v2 直接替换 v1，不兼容旧帧（`syncReq`、`syncBatch`、`deliverAck`、
 
 - 私聊和群聊统一为"会话"：私聊 `p_{较小用户ID}_{较大用户ID}`，群聊 `g_{groupID}`。
 - 每个会话维护单调递增的 `seq`，由服务端在写入 Kafka 前分配；`convId + seq` 唯一定位一条消息，`msgId` 为服务端全局唯一的雪花 ID，JSON 中以字符串传输（`msgId`、`serverMsgId`、`targetMsgId` 均如此，数值超过 JS 安全整数）。Kafka 写入失败时已分配的 seq 会被跳过，因此 seq 允许空洞。
-- 已投递水位 `watermark`：服务端已确认投递（落库或进入热缓存）的最大 seq。`pullMsgsResp.toSeq` 不会超过水位，水位以下仍缺失的 seq 就是空洞，客户端可以直接越过；水位以上的消息还在途，稍后会推送或下次再拉。
-- 服务端回 `serverAck` 表示消息已写入 Kafka（acks=all），之后一定会落库并投递。同一会话的 seq 分配与 Kafka 写入在单机内串行，seq 顺序与 Kafka 分区顺序一致。
-- 未读数 = `maxSeq - readSeq`，再扣除区间内的撤回通知、已撤回消息和自己发的消息（区间不超过 1000 条时精确扣除）；已读位置只前进不回退。
+- `watermark` 是 MySQL 中已落库的最大 seq。`pullMsgsResp.toSeq` 截在此水位，客户端按返回的区间终点推进游标。
+- 服务端回 `serverAck` 表示消息已写入 Kafka（acks=all）。消息消费者逐条提交 MySQL 事务，再尝试在线推送。推送失败时客户端可通过补拉获取已落库消息。
+- seq 通过会话表 `seq_alloc_max` 持久化预留号段，再在内存分配；重启放弃剩余号段，预留上限不会作为 maxSeq 或 watermark 返回。当前要求单写入实例。
+- 未读数按 MySQL 实际有效的他人消息计数，排除撤回通知、已撤回消息、个人删除以及可见下界之前的消息，不计 seq 空洞；无 1000 条上限，随异步落库更新。已读位置只前进不回退。
 - 撤回不是独立帧，而是一条 `msgType=6` 的普通消息，`content` 为 `{"targetSeq","targetMsgId","operatorId"}` 的 JSON 字符串。
 - 入群时 `minSeq = 当前已分配 seq + 1`，新成员看不到入群前的消息。
 
@@ -56,9 +57,7 @@ v2 直接替换 v1，不兼容旧帧（`syncReq`、`syncBatch`、`deliverAck`、
 每个会话在本地维护三个位置：`maxSeq`（服务端已知最大 seq）、`syncedSeq`（本地已连续拉到的 seq）、`readSeq`（已读位置）。
 
 1. 发送：生成 UUID 作为 `msgId`，插入待确认的本地消息；收到 `serverAck` 后写入 seq。收到带该 `clientMsgId` 的 `error` 时标记失败，允许用同一 `msgId` 重试。
-2. 上线/重连：发送 `convSyncReq`。对每个 `ConvView`，若 `maxSeq > syncedSeq` 则发送 `pullMsgs`：
-   - 本地从未同步过（`syncedSeq=0`）：只拉最近 50 条，`fromSeq = max(1, minSeq, maxSeq-49)`；
-   - 否则拉 `[syncedSeq+1, maxSeq]`。
+2. 上线/重连：发送 `convSyncReq`。每个尚未初始化的会话通过 HTTP 历史接口 `beforeSeq=0&limit=50` 获取最新 50 条实际消息，历史窗口的最新 seq 作为同步起点，继续补拉请求期间新增的消息。已有初始窗口的会话拉 `[syncedSeq+1, maxSeq]`。增量响应即使消息为空，只要 `hasMore=true` 仍从 `toSeq+1` 继续。
 3. 推送：收到 `msg` 时，若 `seq == syncedSeq+1` 直接追加并推进；若跳号则补拉 `[syncedSeq+1, seq]`；`syncedSeq=0` 时直接采纳。所有消息按 `seq` 去重。同一会话同时最多一个 `pullMsgs` 在途，期间产生的补拉请求只保留最后一个，返回后按新的 `syncedSeq` 重算区间（10 秒未返回视为丢失；重连时清空）。
 4. 排序：已确认消息按 `seq` 升序，待确认消息（无 seq）统一排在其后按本地时间排序。
 5. 撤回通知：解析 `content`，把 `targetSeq` 对应消息标为已撤回并替换为"消息已撤回"，不弹桌面通知；若原消息是他人发的且在 `readSeq` 之后，未读数减 1。撤回失败（`error` 帧 `clientMsgId` 为 `revoke:` 前缀）时弹出提示。

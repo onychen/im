@@ -1652,6 +1652,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/api.ApiResponse"
                         }
+                    },
+                    "404": {
+                        "description": "动态不存在",
+                        "schema": {
+                            "$ref": "#/definitions/api.ApiResponse"
+                        }
                     }
                 }
             }

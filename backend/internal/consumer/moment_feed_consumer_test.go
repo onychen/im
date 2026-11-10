@@ -123,15 +123,6 @@ func (m *momentConsumerMySQLMock) CreateMomentLike(context.Context, *model.Momen
 func (m *momentConsumerMySQLMock) DeleteMomentLike(context.Context, int64, int64) error {
 	panic("未实现")
 }
-func (m *momentConsumerMySQLMock) GetMomentLikers(context.Context, int64) ([]int64, error) {
-	panic("未实现")
-}
-func (m *momentConsumerMySQLMock) BatchUpsertMomentLikes(context.Context, []model.MomentLike) error {
-	panic("未实现")
-}
-func (m *momentConsumerMySQLMock) BatchDeleteMomentLikes(context.Context, []model.MomentLikeKey) error {
-	panic("未实现")
-}
 func (m *momentConsumerMySQLMock) CreateMomentComment(context.Context, *model.MomentComment) error {
 	panic("未实现")
 }

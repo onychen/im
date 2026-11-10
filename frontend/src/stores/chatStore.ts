@@ -20,6 +20,8 @@ export interface ChatConversation {
   maxSeq: number;
   /** 本地已连续同步到的 seq；(syncedSeq, maxSeq] 是需要补拉的区间，0 表示尚未同步 */
   syncedSeq: number;
+  /** 已通过 HTTP 获取首次历史窗口；重连时保留，避免再次截取窗口 */
+  initialHistoryLoaded?: boolean;
   /** 已上报的已读位置 */
   readSeq: number;
 }
@@ -50,6 +52,8 @@ interface ChatState {
   messagesByConversation: Record<string, ChatMessage[]>;
   /** 各会话是否还有更早的历史（HTTP 分页）；未记录视为 true */
   historyHasMore: Record<string, boolean>;
+  /** 原始历史页的最小 seq，包含不渲染的撤回通知 */
+  historyBeforeSeq: Record<string, number>;
   /** 聊天页轻提示（撤回失败等），由 ChatPage 渲染 */
   toasts: { id: string; message: string; tone: "success" | "error" | "info" }[];
   pushToast: (message: string, tone?: "success" | "error" | "info") => void;
@@ -69,6 +73,8 @@ interface ChatState {
   setConversationIdentity: (convId: string, name: string, avatarUrl?: string, online?: boolean) => void;
   /** 应用会话同步结果；返回各会话需要补拉的区间 */
   applyConvSync: (views: ConvView[]) => PullMsgsReq[];
+  /** 合并首次倒序历史窗口，从窗口最新位置继续增量同步 */
+  applyInitialHistory: (convId: string, msgs: WsMessage[], hasMore: boolean, currentUserId: number) => PullMsgsReq | null;
   /** 合并补拉结果；hasMore 时返回下一页请求 */
   applyPulledMsgs: (resp: PullMsgsResp, currentUserId: number) => PullMsgsReq | null;
   /** 合并上滑加载的历史消息（seq < 当前最小 seq），不影响 syncedSeq / maxSeq */
@@ -80,8 +86,6 @@ interface ChatState {
   removeConversation: (convId: string) => void;
 }
 
-/** 首次同步某个会话时只拉最近这么多条，更早的走 HTTP 历史分页 */
-const INITIAL_PULL_COUNT = 50;
 const REVOKED_TEXT = "消息已撤回";
 
 const previewTargets: Record<string, number> = {
@@ -244,6 +248,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   conversations: [],
   messagesByConversation: {},
   historyHasMore: {},
+  historyBeforeSeq: {},
   toasts: [],
   pushToast: (message, tone = "info") => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -254,13 +259,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   initializePreview: () => {
     if (get().mode === "preview") return;
-    set({ mode: "preview", liveUserId: null, connectionState: "connected", syncCompleted: true, historyHasMore: {}, ...previewState() });
+    set({ mode: "preview", liveUserId: null, connectionState: "connected", syncCompleted: true, historyHasMore: {}, historyBeforeSeq: {}, ...previewState() });
   },
   initializeLive: (userId) => {
     if (get().mode === "live" && get().liveUserId === userId) return;
-    set({ mode: "live", liveUserId: userId, connectionState: "connecting", syncCompleted: false, conversations: [], messagesByConversation: {}, historyHasMore: {} });
+    set({ mode: "live", liveUserId: userId, connectionState: "connecting", syncCompleted: false, conversations: [], messagesByConversation: {}, historyHasMore: {}, historyBeforeSeq: {} });
   },
-  resetSession: () => set({ mode: null, liveUserId: null, connectionState: "idle", syncCompleted: false, conversations: [], messagesByConversation: {}, historyHasMore: {} }),
+  resetSession: () => set({ mode: null, liveUserId: null, connectionState: "idle", syncCompleted: false, conversations: [], messagesByConversation: {}, historyHasMore: {}, historyBeforeSeq: {} }),
   setConnectionState: (connectionState) => set({ connectionState }),
 
   sendText: (conversation, content, preview) => {
@@ -383,8 +388,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const conversations = views.map((view): ChatConversation => {
       const previous = state.conversations.find((item) => item.id === view.convId);
       const syncedSeq = previous?.syncedSeq ?? 0;
-      if (view.maxSeq > syncedSeq) {
-        const fromSeq = syncedSeq > 0 ? syncedSeq + 1 : Math.max(1, view.minSeq, view.maxSeq - INITIAL_PULL_COUNT + 1);
+      if (view.maxSeq > syncedSeq && (previous?.initialHistoryLoaded || syncedSeq > 0)) {
+        const fromSeq = Math.max(1, view.minSeq, syncedSeq + 1);
         pulls.push({ convId: view.convId, fromSeq, toSeq: view.maxSeq });
       }
       return {
@@ -401,11 +406,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
         muted: previous?.muted ?? view.muted,
         maxSeq: Math.max(view.maxSeq, previous?.maxSeq ?? 0),
         syncedSeq,
+        initialHistoryLoaded: previous?.initialHistoryLoaded,
         readSeq: Math.max(view.readSeq, previous?.readSeq ?? 0),
       };
     });
     set({ syncCompleted: true, conversations });
     return pulls;
+  },
+
+  applyInitialHistory: (convId, msgs, hasMore, currentUserId) => {
+    const state = get();
+    const conversation = state.conversations.find((item) => item.id === convId);
+    if (!conversation || state.mode !== "live" || state.liveUserId !== currentUserId) return null;
+    const merged = mergeServerMessages(state.messagesByConversation[convId] ?? [], msgs, currentUserId);
+    // 持久化历史窗口是起点。请求期间的实时推送可能更大，必须从此处继续补齐，不能跳到推送最大值。
+    const syncedSeq = msgs.reduce((latest, msg) => Math.max(latest, msg.seq), 0);
+    const maxSeq = Math.max(conversation.maxSeq, syncedSeq);
+    set({
+      messagesByConversation: { ...state.messagesByConversation, [convId]: merged },
+      historyHasMore: { ...state.historyHasMore, [convId]: hasMore },
+      historyBeforeSeq: msgs.length > 0 ? {
+        ...state.historyBeforeSeq,
+        [convId]: Math.min(state.historyBeforeSeq[convId] ?? Infinity, ...msgs.map((msg) => msg.seq)),
+      } : state.historyBeforeSeq,
+      conversations: state.conversations.map((item) => item.id === convId ? {
+        ...item, maxSeq, syncedSeq, initialHistoryLoaded: true,
+      } : item),
+    });
+    return maxSeq > syncedSeq ? { convId, fromSeq: syncedSeq + 1, toSeq: maxSeq } : null;
   },
 
   applyPulledMsgs: (resp, currentUserId) => {
@@ -415,7 +443,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const conversation = state.conversations.find((item) => item.id === resp.convId);
     const contiguous = conversation ? conversation.syncedSeq === 0 || resp.fromSeq <= conversation.syncedSeq + 1 : false;
     const newest = resp.msgs.length > 0 ? resp.msgs[resp.msgs.length - 1] : undefined;
-    // 服务端已把 toSeq 截到已投递水位；这里再取一次 min 作防御。水位以下缺失的 seq 是空洞，可直接跨过。
+    // 服务端用 MySQL 已落库水位限制 toSeq，这里再取一次 min 作防御。
     const reached = Math.min(resp.toSeq, resp.watermark ?? resp.toSeq);
     set({
       messagesByConversation: { ...state.messagesByConversation, [resp.convId]: merged },
@@ -435,6 +463,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   prependHistory: (convId, msgs, hasMore, currentUserId) => set((state) => ({
     messagesByConversation: { ...state.messagesByConversation, [convId]: mergeServerMessages(state.messagesByConversation[convId] ?? [], msgs, currentUserId) },
     historyHasMore: { ...state.historyHasMore, [convId]: hasMore },
+    historyBeforeSeq: msgs.length > 0 ? {
+      ...state.historyBeforeSeq,
+      [convId]: Math.min(state.historyBeforeSeq[convId] ?? Infinity, ...msgs.map((msg) => msg.seq)),
+    } : state.historyBeforeSeq,
   })),
 
   revokeMessage: (convId, seq) => set((state) => {
@@ -469,8 +501,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   }),
   removeConversation: (convId) => set((state) => {
     const messagesByConversation = { ...state.messagesByConversation };
+    const historyHasMore = { ...state.historyHasMore };
+    const historyBeforeSeq = { ...state.historyBeforeSeq };
     delete messagesByConversation[convId];
-    return { conversations: state.conversations.filter((conversation) => conversation.id !== convId), messagesByConversation };
+    delete historyHasMore[convId];
+    delete historyBeforeSeq[convId];
+    return { conversations: state.conversations.filter((conversation) => conversation.id !== convId), messagesByConversation, historyHasMore, historyBeforeSeq };
   }),
 }));
 

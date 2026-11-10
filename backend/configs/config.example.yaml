@@ -29,9 +29,8 @@ kafka:
   commit_interval_ms: 1000     # offset 异步提交间隔；负数表示每条同步提交
 
 message:
+  seq_segment_size: 1000       # 会话 seq 号段大小；单写入实例，重启放弃剩余号码
   node_id: 0                   # 雪花算法节点号（0-1023），单机部署保持 0
-  persist_batch_size: 200      # 消息落库消费者攒批阈值
-  persist_flush_ms: 100        # 消息落库消费者最大攒批间隔（毫秒）
 
 jwt:
   secret: "CHANGE-THIS-TO-A-STRONG-RANDOM-SECRET-32-CHARS-MIN"  # 生产环境中务必修改！
@@ -46,6 +45,3 @@ file:
 moment:
   big_user_friend_threshold: 500    # 好友数超过此值的用户为"大V"，发布走拉模式（仅存寄件箱，不写扩散）
   timeline_max_len: 1000            # 每个用户收件箱/寄件箱最多保留的动态条数（扇出后裁剪最旧的）
-  like_persist_batch_size: 200      # 点赞落库消费者攒批阈值（攒够即批量写入 MySQL）
-  like_persist_flush_ms: 500        # 点赞落库消费者最大攒批间隔（毫秒）
-  like_cache_ttl_hours: 168         # 点赞 Redis 缓存（集合/计数/预热标记）TTL（小时），默认 7 天

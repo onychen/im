@@ -3,7 +3,6 @@ package consumer
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/goim/goim/internal/model"
 	"github.com/goim/goim/internal/repository"
@@ -83,23 +82,3 @@ func (m *mockRedisRepo) GetTimelinePage(context.Context, int64, int64, int64, in
 func (m *mockRedisRepo) GetOutboxPage(context.Context, int64, int64, int64, int) ([]model.FeedEntry, error) {
 	return nil, nil
 }
-
-func (m *mockRedisRepo) LikeMomentAtomic(context.Context, int64, int64) (bool, int64, error) {
-	return false, 0, nil
-}
-
-func (m *mockRedisRepo) UnlikeMomentAtomic(context.Context, int64, int64) (bool, int64, error) {
-	return false, 0, nil
-}
-
-func (m *mockRedisRepo) EnsureMomentLikesLoaded(context.Context, int64, func(context.Context) ([]int64, error), time.Duration) error {
-	return nil
-}
-
-func (m *mockRedisRepo) GetMomentLikeStats(context.Context, int64, []int64) (map[int64]int64, map[int64]bool, error) {
-	return map[int64]int64{}, map[int64]bool{}, nil
-}
-
-func (m *mockRedisRepo) GetMomentLikerIDs(context.Context, int64) ([]int64, error) { return nil, nil }
-
-func (m *mockRedisRepo) DeleteMomentLikes(context.Context, int64) error { return nil }

@@ -151,7 +151,7 @@ export interface PullMsgsReq {
 
 /**
  * 补拉结果；hasMore=true 时从 toSeq+1 继续。
- * watermark 为服务端已投递水位：toSeq 不会超过它，水位以下仍缺失的 seq 是空洞（Kafka 写失败），无需再拉。
+ * watermark 为 MySQL 中已落库的最大 seq。toSeq 不会超过该水位。
  */
 export interface PullMsgsResp {
   convId:    string;

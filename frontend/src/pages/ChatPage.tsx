@@ -38,6 +38,7 @@ export function ChatPage() {
   const setConversationMuted = useChatStore((state) => state.setConversationMuted);
   const toasts = useChatStore((state) => state.toasts);
   const historyHasMore = useChatStore((state) => state.historyHasMore[conversationId ?? ""] ?? true);
+  const historyBeforeSeq = useChatStore((state) => state.historyBeforeSeq[conversationId ?? ""]);
   const previewMode = useAuthStore((state) => state.previewMode);
   const currentUserId = useAuthStore((state) => state.user?.id ?? 0);
   const selected = conversations.find((item) => item.id === conversationId);
@@ -101,7 +102,7 @@ export function ChatPage() {
 
   const loadOlderMessages = async () => {
     if (!selectedId || previewMode || historyLoading || !historyHasMore) return;
-    const oldestSeq = messages.reduce((min, item) => (item.seq && item.seq < min ? item.seq : min), Number.POSITIVE_INFINITY);
+    const oldestSeq = historyBeforeSeq ?? messages.reduce((min, item) => (item.seq && item.seq < min ? item.seq : min), Number.POSITIVE_INFINITY);
     if (oldestSeq <= 1) {
       useChatStore.getState().prependHistory(selectedId, [], false, currentUserId);
       return;
@@ -113,8 +114,8 @@ export function ChatPage() {
       const beforeSeq = Number.isFinite(oldestSeq) ? oldestSeq : 0;
       const page = await conversationsApi.history(selectedId, { beforeSeq, limit: HISTORY_PAGE_SIZE });
       if (scrollContainer && page.msgs.length > 0) historyAnchorRef.current = { convId: selectedId, height: scrollContainer.scrollHeight, top: scrollContainer.scrollTop };
-      // 一页全被"仅自己删除"过滤掉时无法再推进游标，按没有更多处理，避免反复请求同一页。
-      useChatStore.getState().prependHistory(selectedId, page.msgs as WsMessage[], page.hasMore && page.msgs.length > 0, currentUserId);
+      // 服务端在分页前过滤个人删除记录，游标按实际返回的消息推进。
+      useChatStore.getState().prependHistory(selectedId, page.msgs as WsMessage[], page.hasMore, currentUserId);
     } catch {
       useChatStore.getState().pushToast("加载历史消息失败，请稍后重试", "error");
     } finally {

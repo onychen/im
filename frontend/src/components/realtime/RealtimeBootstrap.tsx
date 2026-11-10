@@ -4,11 +4,37 @@ import { buildPrivateConvId, ConvType, MsgType, parseRevokeClientMsgId, privateP
 import { useAuthStore } from "../../stores/authStore";
 import { useChatStore } from "../../stores/chatStore";
 import { goimSocket } from "../../realtime/socket";
-import { friendsApi, groupsApi, settingsApi } from "../../lib/api";
+import { conversationsApi, friendsApi, groupsApi, settingsApi } from "../../lib/api";
 import { configureNotifications, notifyIncomingMessage } from "../../realtime/notifications";
 import { createPullScheduler } from "../../realtime/pullScheduler";
 
 let loadedSettings: Awaited<ReturnType<typeof settingsApi.get>> | null = null;
+let connectionGeneration = 0;
+const initialHistoryLoads = new Set<string>();
+
+async function loadInitialHistory(convId: string, userId: number, retry = false) {
+  const chat = useChatStore.getState();
+  if (initialHistoryLoads.has(convId) || chat.conversations.find((item) => item.id === convId)?.initialHistoryLoaded) return;
+  const generation = connectionGeneration;
+  initialHistoryLoads.add(convId);
+  try {
+    const page = await conversationsApi.history(convId, { beforeSeq: 0, limit: 50 });
+    if (generation !== connectionGeneration || useChatStore.getState().liveUserId !== userId) return;
+    initialHistoryLoads.delete(convId);
+    requestPull(useChatStore.getState().applyInitialHistory(convId, page.msgs, page.hasMore, userId));
+  } catch {
+    if (generation !== connectionGeneration || useChatStore.getState().liveUserId !== userId) return;
+    if (!retry) useChatStore.getState().pushToast("加载最新消息失败，正在重试", "error");
+    window.setTimeout(() => {
+      const current = useChatStore.getState();
+      if (generation === connectionGeneration && current.connectionState === "connected" && current.conversations.some((item) => item.id === convId)) {
+        void loadInitialHistory(convId, userId, true);
+      }
+    }, 2000);
+  } finally {
+    if (generation === connectionGeneration) initialHistoryLoads.delete(convId);
+  }
+}
 
 const pulls = createPullScheduler(
   (request) => goimSocket.send({ type: "pullMsgs", data: request }),
@@ -46,6 +72,8 @@ async function refreshPrivateConversationIdentities() {
 }
 
 function requestPull(request: PullMsgsReq | null) {
+  // 初始窗口尚在加载时先积累 maxSeq，窗口返回后统一补齐期间的新消息。
+  if (request && initialHistoryLoads.has(request.convId)) return;
   pulls.request(request);
 }
 
@@ -85,6 +113,7 @@ function handleServerMessage(message: ServerWsMessage, currentUserId: number, cl
     }
     case "convSync":
       for (const request of chat.applyConvSync(message.data.conversations)) requestPull(request);
+      for (const view of message.data.conversations) void loadInitialHistory(view.convId, currentUserId);
       applyMutedConversations();
       void refreshPrivateConversationIdentities();
       void groupsApi.list().then((groups) => {
@@ -143,9 +172,11 @@ export function RealtimeBootstrap() {
       onStateChange: (state) => {
         useChatStore.getState().setConnectionState(state);
         if (state === "connected") {
-          // 上线与重连统一走 convSync：对比各会话 maxSeq 与本地 syncedSeq，再按区间 pullMsgs。
+          // 首次会话走 HTTP 最新历史窗口，已初始化会话从 syncedSeq 继续增量补拉。
           // 断线前在途的 pullMsgs 响应可能已丢失，先清空调度状态。
           pulls.reset();
+          connectionGeneration++;
+          initialHistoryLoads.clear();
           requestConvSync();
         }
       },
@@ -157,6 +188,8 @@ export function RealtimeBootstrap() {
     const connectTimer = window.setTimeout(() => goimSocket.connect(accessToken), 0);
     const onlineRefreshTimer = window.setInterval(() => void refreshPrivateConversationIdentities(), 15_000);
     return () => {
+      connectionGeneration++;
+      initialHistoryLoads.clear();
       window.clearTimeout(connectTimer);
       window.clearInterval(onlineRefreshTimer);
       goimSocket.disconnect(false);

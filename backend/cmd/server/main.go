@@ -28,7 +28,6 @@ import (
 	"github.com/goim/goim/internal/idgen"
 	"github.com/goim/goim/internal/infra"
 	"github.com/goim/goim/internal/middleware"
-	redislua "github.com/goim/goim/internal/redis"
 	"github.com/goim/goim/internal/repository"
 	"github.com/goim/goim/internal/service"
 	"github.com/goim/goim/internal/ws"
@@ -64,9 +63,13 @@ func run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("create MySQL pool: %w", err)
 	}
-	defer db.Close()
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("get MySQL pool: %w", err)
+	}
+	defer sqlDB.Close()
 	checkCtx, checkCancel := context.WithTimeout(ctx, 5*time.Second)
-	err = db.PingContext(checkCtx)
+	err = sqlDB.PingContext(checkCtx)
 	checkCancel()
 	if err != nil {
 		return fmt.Errorf("connect MySQL: %w", err)
@@ -95,10 +98,6 @@ func run(configPath string) error {
 		func(ready bool, err error) {
 			logger.Warn("Kafka readiness changed", zap.Bool("ready", ready), zap.Error(err))
 		})
-	if err := redislua.LoadLuaScripts(rdb, ctx); err != nil {
-		return fmt.Errorf("load Redis Lua scripts: %w", err)
-	}
-
 	mysqlRepo := repository.NewMySQLRepo(db)
 	redisRepo := repository.NewRedisRepo(rdb)
 	msgCache := repository.NewMessageCache(rdb)
@@ -113,11 +112,12 @@ func run(configPath string) error {
 	}
 
 	// mysqlRepo 同时实现 MySQLRepo（用户/好友/群组）与 MessageStore（消息/会话）。
-	msgSvc := service.NewMsgService(mysqlRepo, mysqlRepo, msgCache, relations, mqRepo, ids, cm, logger)
+	msgSvc := service.NewMsgService(mysqlRepo, mysqlRepo, msgCache, relations, mqRepo, ids, cm, logger).
+		WithSeqSegmentSize(cfg.Message.SeqSegmentSize)
 	authSvc := service.NewAuthService(mysqlRepo, cfg.JWT.Secret, cfg.JWT.AccessExpHours, cfg.JWT.RefreshExpDays)
 	friendSvc := service.NewFriendService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations)
 	groupSvc := service.NewGroupService(mysqlRepo, redisRepo, logger).WithMessaging(mysqlRepo, relations, msgSvc)
-	momentSvc := service.NewMomentService(mysqlRepo, redisRepo, mqRepo, logger, time.Duration(cfg.Moment.LikeCacheTTLHours)*time.Hour)
+	momentSvc := service.NewMomentService(mysqlRepo, redisRepo, logger)
 	settingsSvc := service.NewSettingsService(mysqlRepo, logger)
 	dispatcher := ws.NewMessageDispatcher(msgSvc, friendSvc)
 
@@ -131,7 +131,7 @@ func run(configPath string) error {
 		api.NewUploadHandler(cfg.Server.UploadDir, cfg.File.MaxSizeMB, cfg.File.AllowedExts, mysqlRepo),
 		api.NewAvatarHandler())
 
-	// msg_topic 上两个独立的消费者组：persist 负责落库，deliver 负责缓存与在线推送。
+	// 沿用 msg-persist 的 offset，逐条落库后更新缓存并推送。
 	msgDLQ := consumer.DeadLetterPolicy{
 		MaxAttempts: consumer.DefaultDeadLetterAttempts,
 		Writer:      mqWriter,
@@ -139,29 +139,21 @@ func run(configPath string) error {
 	}
 	persistConsumer := consumer.NewMsgPersistConsumer(
 		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgPersist),
-		mysqlRepo, logger, cfg.Message.PersistBatchSize, cfg.Message.PersistFlushMs,
+		mysqlRepo, msgSvc, logger,
 	).WithDeadLetter(msgDLQ)
 	if err := persistConsumer.Start(ctx); err != nil {
 		return fmt.Errorf("start message persist consumer: %w", err)
-	}
-	deliverConsumer := consumer.NewMsgDeliverConsumer(
-		kafkaClient.NewReader(infra.TopicMsg, infra.GroupMsgDeliver),
-		msgSvc, logger,
-	).WithDeadLetter(msgDLQ)
-	if err := deliverConsumer.Start(ctx); err != nil {
-		return fmt.Errorf("start message deliver consumer: %w", err)
 	}
 	momentConsumer := consumer.NewMomentFeedConsumer(kafkaClient.NewReader(infra.TopicMomentPush, infra.GroupMomentFeed), mysqlRepo, redisRepo, logger, cfg.Moment.BigUserFriendThreshold, cfg.Moment.TimelineMaxLen)
 	if err := momentConsumer.Start(ctx); err != nil {
 		return fmt.Errorf("start moment feed consumer: %w", err)
 	}
-	likeConsumer := consumer.NewLikePersistConsumer(kafkaClient.NewReader(infra.TopicLikePersist, infra.GroupLikePersist), mysqlRepo, logger, cfg.Moment.LikePersistBatchSize, cfg.Moment.LikePersistFlushMs)
-	if err := likeConsumer.Start(ctx); err != nil {
-		return fmt.Errorf("start like persistence consumer: %w", err)
-	}
 	infra.StartCleanupTask(rdb, logger, time.Hour)
-	// Cancel workers before the deferred Kafka writers and database clients close.
-	defer cancel()
+	relayDone := consumer.StartMomentOutboxRelay(ctx, mysqlRepo, mqRepo.PublishMomentPush, logger)
+	defer func() {
+		cancel()
+		<-relayDone
+	}()
 
 	if cfg.Server.PprofPort > 0 {
 		pprofServer := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", cfg.Server.PprofPort), Handler: http.DefaultServeMux}

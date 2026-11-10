@@ -27,29 +27,41 @@ type recordingMessageStore struct {
 	deletedUserConv [][2]interface{}           // {userID, convID}
 	userGroupIDs    map[int64][]int64
 
-	ucs        map[ucKey]model.UserConversation
-	maxSeq     map[string]int64           // GetMaxSeq 返回值
-	messages   map[string][]model.Message // convID -> 已落库消息
-	convs      map[string]model.Conversation
-	nonUnread  map[string]int64
-	briefs     map[int64]repository.UserBrief
-	groupNames map[int64]string
-	rangeCalls []repository.SeqRange
+	ucs                map[ucKey]model.UserConversation
+	maxSeq             map[string]int64           // GetMaxSeq 返回值
+	messages           map[string][]model.Message // convID -> 已落库消息
+	convs              map[string]model.Conversation
+	unread             map[string]int64
+	unreadErr          error
+	allocated          map[string]int64
+	reserveCalls       int
+	reserveErr         error
+	deleted            map[ucKey]map[int64]struct{}
+	deletedErr         error
+	historyVersions    map[string]int64
+	historyWindowReads int
+	historyPageReads   int
+	briefs             map[int64]repository.UserBrief
+	groupNames         map[int64]string
+	rangeCalls         []repository.SeqRange
 }
 
 func newRecordingMessageStore() *recordingMessageStore {
 	return &recordingMessageStore{
-		ensuredConvs: make(map[string]int),
-		userConvs:    make(map[string][]int64),
-		joinMinSeq:   make(map[string]map[int64]int64),
-		userGroupIDs: make(map[int64][]int64),
-		ucs:          make(map[ucKey]model.UserConversation),
-		maxSeq:       make(map[string]int64),
-		messages:     make(map[string][]model.Message),
-		convs:        make(map[string]model.Conversation),
-		nonUnread:    make(map[string]int64),
-		briefs:       make(map[int64]repository.UserBrief),
-		groupNames:   make(map[int64]string),
+		ensuredConvs:    make(map[string]int),
+		userConvs:       make(map[string][]int64),
+		joinMinSeq:      make(map[string]map[int64]int64),
+		userGroupIDs:    make(map[int64][]int64),
+		ucs:             make(map[ucKey]model.UserConversation),
+		maxSeq:          make(map[string]int64),
+		messages:        make(map[string][]model.Message),
+		convs:           make(map[string]model.Conversation),
+		unread:          make(map[string]int64),
+		allocated:       make(map[string]int64),
+		deleted:         make(map[ucKey]map[int64]struct{}),
+		historyVersions: make(map[string]int64),
+		briefs:          make(map[int64]repository.UserBrief),
+		groupNames:      make(map[int64]string),
 	}
 }
 
@@ -60,6 +72,18 @@ func (s *recordingMessageStore) GetMaxSeq(_ context.Context, convID string) (int
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.maxSeq[convID], nil
+}
+func (s *recordingMessageStore) ReserveSeqRange(_ context.Context, convID string, convType int, size, floor int64) (int64, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reserveCalls++
+	if s.reserveErr != nil {
+		return 0, 0, s.reserveErr
+	}
+	s.ensuredConvs[convID] = convType
+	base := max(s.allocated[convID], s.maxSeq[convID], floor)
+	s.allocated[convID] = base + size
+	return base + 1, base + size, nil
 }
 func (s *recordingMessageStore) GetMessagesBySeqRange(_ context.Context, convID string, fromSeq, toSeq int64, limit int) ([]model.Message, error) {
 	s.mu.Lock()
@@ -76,8 +100,42 @@ func (s *recordingMessageStore) GetMessagesBySeqRange(_ context.Context, convID 
 	}
 	return out, nil
 }
-func (s *recordingMessageStore) GetMessagesBefore(_ context.Context, _ string, _, _ int64, _ int) ([]model.Message, error) {
-	return nil, nil
+func (s *recordingMessageStore) GetMessagesBefore(_ context.Context, userID int64, convID string, before, floor int64, limit int) ([]model.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.historyPageReads++
+	msgs := make([]model.Message, 0)
+	for _, msg := range s.messages[convID] {
+		_, deleted := s.deleted[ucKey{userID, convID}][msg.Seq]
+		if msg.Seq < before && msg.Seq >= floor && !deleted {
+			msgs = append(msgs, msg)
+		}
+	}
+	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Seq > msgs[j].Seq })
+	if len(msgs) > limit {
+		msgs = msgs[:limit]
+	}
+	return msgs, nil
+}
+func (s *recordingMessageStore) GetHistoryState(_ context.Context, userID int64, convID string, _ int) (*repository.HistoryState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	uc, ok := s.ucs[ucKey{userID, convID}]
+	if !ok {
+		return nil, nil
+	}
+	return &repository.HistoryState{MinSeq: uc.MinSeq, Version: s.historyVersions[convID]}, nil
+}
+func (s *recordingMessageStore) GetGroupHistoryWindow(_ context.Context, convID string, version int64, limit int) ([]model.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.historyWindowReads++
+	if version != s.historyVersions[convID] {
+		return nil, nil
+	}
+	msgs := append([]model.Message(nil), s.messages[convID]...)
+	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Seq > msgs[j].Seq })
+	return msgs[:min(len(msgs), limit)], nil
 }
 func (s *recordingMessageStore) GetMessage(_ context.Context, convID string, seq int64) (*model.Message, error) {
 	s.mu.Lock()
@@ -155,19 +213,35 @@ func (s *recordingMessageStore) GetUserConversation(_ context.Context, userID in
 	}
 	return nil, nil
 }
-func (s *recordingMessageStore) UpdateReadSeq(_ context.Context, _ int64, _ string, _ int64) error {
+func (s *recordingMessageStore) UpdateReadSeq(_ context.Context, userID int64, convID string, seq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := ucKey{userID, convID}
+	uc := s.ucs[key]
+	uc.ReadSeq = max(uc.ReadSeq, seq)
+	s.ucs[key] = uc
 	return nil
 }
-func (s *recordingMessageStore) UpdateMinSeq(_ context.Context, _ int64, _ string, _ int64, _ bool) error {
+func (s *recordingMessageStore) UpdateMinSeq(_ context.Context, userID int64, convID string, seq int64, hide bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := ucKey{userID, convID}
+	uc := s.ucs[key]
+	uc.MinSeq, uc.ReadSeq = max(uc.MinSeq, seq), max(uc.ReadSeq, seq-1)
+	uc.Hidden = uc.Hidden || hide
+	s.ucs[key] = uc
 	return nil
 }
-func (s *recordingMessageStore) CountNonUnread(_ context.Context, _ int64, ranges []repository.SeqRange) (map[string]int64, error) {
+func (s *recordingMessageStore) CountUnread(_ context.Context, _ int64, ranges []repository.SeqRange) (map[string]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rangeCalls = append(s.rangeCalls, ranges...)
+	if s.unreadErr != nil {
+		return nil, s.unreadErr
+	}
 	out := make(map[string]int64)
 	for _, r := range ranges {
-		if n, ok := s.nonUnread[r.ConvID]; ok {
+		if n, ok := s.unread[r.ConvID]; ok {
 			out[r.ConvID] = n
 		}
 	}
@@ -198,8 +272,19 @@ func (s *recordingMessageStore) GetGroupNames(_ context.Context, ids []int64) (m
 func (s *recordingMessageStore) AddUserDeletedMessage(_ context.Context, _ int64, _ string, _ int64) error {
 	return nil
 }
-func (s *recordingMessageStore) GetUserDeletedSeqs(_ context.Context, _ int64, _ string, _, _ int64) (map[int64]struct{}, error) {
-	return map[int64]struct{}{}, nil
+func (s *recordingMessageStore) GetUserDeletedSeqs(_ context.Context, userID int64, convID string, from, to int64) (map[int64]struct{}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deletedErr != nil {
+		return nil, s.deletedErr
+	}
+	out := make(map[int64]struct{})
+	for seq := range s.deleted[ucKey{userID, convID}] {
+		if seq >= from && seq <= to {
+			out[seq] = struct{}{}
+		}
+	}
+	return out, nil
 }
 func (s *recordingMessageStore) ListUserGroupIDs(_ context.Context, userID int64) ([]int64, error) {
 	s.mu.Lock()
@@ -216,8 +301,10 @@ type recordingRelations struct {
 	groupInvalidations  []int64
 }
 
-func (r *recordingRelations) IsFriend(_ context.Context, _, _ int64) (bool, error)  { return true, nil }
-func (r *recordingRelations) IsBlocked(_ context.Context, _, _ int64) (bool, error) { return false, nil }
+func (r *recordingRelations) IsFriend(_ context.Context, _, _ int64) (bool, error) { return true, nil }
+func (r *recordingRelations) IsBlocked(_ context.Context, _, _ int64) (bool, error) {
+	return false, nil
+}
 func (r *recordingRelations) GetGroupMembers(_ context.Context, _ int64) ([]model.GroupMember, error) {
 	return nil, nil
 }
@@ -243,20 +330,27 @@ func (r *recordingRelations) InvalidateGroupMembers(_ context.Context, groupID i
 // fakeSeqReader 是 ConvSeqReader 的测试替身。
 type fakeSeqReader map[string]int64
 
-func (f fakeSeqReader) CurrentSeq(_ context.Context, convID string) (int64, error) {
-	return f[convID], nil
+func (f fakeSeqReader) WithCurrentSeq(_ context.Context, convID string, apply func(int64) error) error {
+	return apply(f[convID])
 }
 
 // fakeMessageCache 是 repository.MessageCache 的内存实现，语义与 Redis 版本一致：
-// seq 计数器缺失时 NextSeq 返回 ErrSeqNotInitialized；去重 key 有 pending（nil）/ 已完成两种状态。
+// 旧 seq 只读用于迁移；去重 key 有 pending（nil）/ 已完成两种状态。
 type fakeMessageCache struct {
 	mu sync.Mutex
 
-	seqs    map[string]int64
-	dedup   map[string]*model.ServerAck
-	metas   map[string]repository.ConvMeta
-	cached  map[string][]model.Message
-	revoked map[string][]int64
+	seqs       map[string]int64
+	dedup      map[string]*model.ServerAck
+	metas      map[string]repository.ConvMeta
+	cached     map[string][]model.Message
+	revoked    map[string][]int64
+	history    map[string]fakeGroupHistory
+	historyErr error
+}
+
+type fakeGroupHistory struct {
+	version int64
+	msgs    []model.Message
 }
 
 func newFakeMessageCache() *fakeMessageCache {
@@ -266,30 +360,13 @@ func newFakeMessageCache() *fakeMessageCache {
 		metas:   make(map[string]repository.ConvMeta),
 		cached:  make(map[string][]model.Message),
 		revoked: make(map[string][]int64),
+		history: make(map[string]fakeGroupHistory),
 	}
 }
 
 func dedupKey(uid int64, cid string) string { return fmt.Sprintf("%d:%s", uid, cid) }
 
-func (c *fakeMessageCache) NextSeq(_ context.Context, convID string) (int64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cur, ok := c.seqs[convID]
-	if !ok {
-		return 0, repository.ErrSeqNotInitialized
-	}
-	c.seqs[convID] = cur + 1
-	return cur + 1, nil
-}
-func (c *fakeMessageCache) InitSeq(_ context.Context, convID string, base int64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.seqs[convID]; !ok {
-		c.seqs[convID] = base
-	}
-	return nil
-}
-func (c *fakeMessageCache) CurrentSeq(_ context.Context, convID string) (int64, bool, error) {
+func (c *fakeMessageCache) LegacySeq(_ context.Context, convID string) (int64, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v, ok := c.seqs[convID]
@@ -356,6 +433,21 @@ func (c *fakeMessageCache) GetCachedMessage(_ context.Context, convID string, se
 	}
 	return nil, nil
 }
+func (c *fakeMessageCache) GetGroupHistory(_ context.Context, convID string, version int64) ([]model.Message, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.history[convID]
+	if entry.version != version {
+		return nil, c.historyErr
+	}
+	return entry.msgs, c.historyErr
+}
+func (c *fakeMessageCache) SetGroupHistory(_ context.Context, convID string, version int64, msgs []model.Message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.history[convID] = fakeGroupHistory{version: version, msgs: append([]model.Message(nil), msgs...)}
+	return nil
+}
 func (c *fakeMessageCache) GetConvMetas(_ context.Context, ids []string) (map[string]repository.ConvMeta, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -387,8 +479,7 @@ func (q *fakeMQ) PublishMessage(_ context.Context, msg *model.Message) error {
 	q.published = append(q.published, *msg)
 	return nil
 }
-func (q *fakeMQ) PublishMomentPush(_ context.Context, _ *model.Moment) error  { return nil }
-func (q *fakeMQ) PublishLikeEvent(_ context.Context, _ *model.LikeEvent) error { return nil }
+func (q *fakeMQ) PublishMomentPush(_ context.Context, _ *model.Moment) error { return nil }
 
 var (
 	_ repository.MessageStore  = (*recordingMessageStore)(nil)

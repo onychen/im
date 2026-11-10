@@ -9,6 +9,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -26,19 +28,19 @@ import (
 
 // 错误文案保持与 api.errorCodeMap 一致。
 const (
-	ErrNotFriend          = "不是好友"
-	ErrBlocked            = "你已被对方拉黑"
-	ErrDuplicate          = "消息正在发送中"
-	ErrNotMember          = "不是该群组的成员"
-	ErrMuted              = "你已被禁言"
-	ErrRevokeFail         = "无法撤回此消息"
-	ErrMsgNotRevocable    = "消息无法撤回（未找到或已过时效）"
-	ErrMsgRevokeNotOwner  = "仅发送者可撤回消息"
-	ErrMsgDeleteFailed    = "删除消息失败"
-	ErrConvNotFound       = "会话不存在"
-	ErrMsgInvalid         = "消息字段无效"
-	ErrMsgSendFailed      = "消息发送失败，请重试"
-	ErrMsgInternal        = "服务器内部错误"
+	ErrNotFriend         = "不是好友"
+	ErrBlocked           = "你已被对方拉黑"
+	ErrDuplicate         = "消息正在发送中"
+	ErrNotMember         = "不是该群组的成员"
+	ErrMuted             = "你已被禁言"
+	ErrRevokeFail        = "无法撤回此消息"
+	ErrMsgNotRevocable   = "消息无法撤回（未找到或已过时效）"
+	ErrMsgRevokeNotOwner = "仅发送者可撤回消息"
+	ErrMsgDeleteFailed   = "删除消息失败"
+	ErrConvNotFound      = "会话不存在"
+	ErrMsgInvalid        = "消息字段无效"
+	ErrMsgSendFailed     = "消息发送失败，请重试"
+	ErrMsgInternal       = "服务器内部错误"
 )
 
 // 消息链路错误码：WebSocket 的 error 帧与 HTTP 响应共用。
@@ -95,17 +97,16 @@ func AsMsgError(err error) *MsgError {
 // ──────────────────────────────────────────────────────
 
 const (
-	revokeWindow      = 2 * time.Minute
-	pullMaxBatch      = 100
-	historyMaxLimit   = 100
-	searchMaxLimit    = 100
-	maxClientMsgIDLen = 128
-	maxContentBytes   = 1 << 20
-	msgOpTimeout      = 5 * time.Second
-	convLockShards    = 256
-	// unreadExactLimit 以内的未读数会扣除撤回通知、已撤回消息和自己发的消息；
-	// 超过时直接用 maxSeq-readSeq（前端展示 99+，精确值意义不大，也避免大范围扫描）。
-	unreadExactLimit = 1000
+	revokeWindow           = 2 * time.Minute
+	pullMaxBatch           = 100
+	historyMaxLimit        = 100
+	groupHistoryWindowSize = 200
+	searchMaxLimit         = 100
+	maxClientMsgIDLen      = 128
+	maxContentBytes        = 1 << 20
+	msgOpTimeout           = 5 * time.Second
+	convLockShards         = 256
+	defaultSeqSegmentSize  = 1000
 )
 
 // convLocks 按 convId 分片的互斥锁，保证同一会话"分配 seq → 写 Kafka"串行执行，
@@ -139,18 +140,25 @@ func (l *convLocks) lock(ctx context.Context, convID string) (func(), error) {
 //	同步：convSyncReq 返回会话列表（maxSeq/readSeq/unread），客户端按 seq 空缺发 pullMsgs 补拉
 //	已读：readAck{convId, seq}，只前进
 //	撤回：校验后作为一条 msgType=6 的通知消息走正常发送链路
-//	投递：deliver 消费者调用 DeliverMessage，更新热缓存后推送给在线成员
+//	投递：msg-persist 提交数据库事务后调用 DeliverMessage，更新热缓存后推送给在线成员
 type MsgService struct {
-	mysql     repository.MySQLRepo
-	store     repository.MessageStore
-	cache     repository.MessageCache
-	relations repository.RelationCache
-	mq        repository.MQRepo
-	ids       *idgen.Snowflake
-	cm        *conn.ConnectionManager
-	logger    *zap.Logger
-	now       func() time.Time
-	locks     *convLocks
+	mysql       repository.MySQLRepo
+	store       repository.MessageStore
+	cache       repository.MessageCache
+	relations   repository.RelationCache
+	mq          repository.MQRepo
+	ids         *idgen.Snowflake
+	cm          *conn.ConnectionManager
+	logger      *zap.Logger
+	now         func() time.Time
+	locks       *convLocks
+	segments    sync.Map // convID -> *seqSegment
+	segmentSize int64
+}
+
+type seqSegment struct {
+	last atomic.Int64 // 发送时持锁取号，已读上报可以直接读取实际分配位置
+	end  int64        // 发布号段后固定
 }
 
 // NewMsgService 创建 MsgService。
@@ -165,17 +173,26 @@ func NewMsgService(
 	logger *zap.Logger,
 ) *MsgService {
 	return &MsgService{
-		mysql:     mysql,
-		store:     store,
-		cache:     cache,
-		relations: relations,
-		mq:        mq,
-		ids:       ids,
-		cm:        cm,
-		logger:    logger,
-		now:       time.Now,
-		locks:     newConvLocks(),
+		mysql:       mysql,
+		store:       store,
+		cache:       cache,
+		relations:   relations,
+		mq:          mq,
+		ids:         ids,
+		cm:          cm,
+		logger:      logger,
+		now:         time.Now,
+		locks:       newConvLocks(),
+		segmentSize: defaultSeqSegmentSize,
 	}
+}
+
+// WithSeqSegmentSize 在启动、处理消息之前配置号段大小；<=0 使用默认值。
+func (s *MsgService) WithSeqSegmentSize(size int64) *MsgService {
+	if size > 0 {
+		s.segmentSize = size
+	}
+	return s
 }
 
 // ──────────────────────────────────────────────────────
@@ -407,23 +424,46 @@ func (s *MsgService) submit(ctx context.Context, msg *model.Message) (*model.Ser
 	return ack, nil
 }
 
-// nextSeq 分配会话内下一个 seq。计数器丢失时用 max(已落库 seq, 已投递 seq) 校正后再分配。
+// nextSeq 在会话锁内调用。只有换段才访问 MySQL，预留成功后在内存中取号。
 func (s *MsgService) nextSeq(ctx context.Context, convID string) (int64, error) {
-	seq, err := s.cache.NextSeq(ctx, convID)
-	if !errors.Is(err, repository.ErrSeqNotInitialized) {
-		return seq, err
+	var segment *seqSegment
+	var last int64
+	if value, ok := s.segments.Load(convID); ok {
+		segment = value.(*seqSegment)
+		last = segment.last.Load()
+		if last < segment.end {
+			return segment.last.Add(1), nil
+		}
 	}
 	base, err := s.seqBase(ctx, convID)
 	if err != nil {
 		return 0, err
 	}
-	if err := s.cache.InitSeq(ctx, convID, base); err != nil {
+	if segment == nil {
+		// 升级时保留旧计数器作为下限，不再使用它逐条取号。
+		legacy, _, err := s.cache.LegacySeq(ctx, convID)
+		if err != nil {
+			return 0, err
+		}
+		base = max(base, legacy)
+	} else {
+		base = max(base, last)
+	}
+	parsed, err := model.ParseConvID(convID)
+	if err != nil {
 		return 0, err
 	}
-	return s.cache.NextSeq(ctx, convID)
+	start, end, err := s.store.ReserveSeqRange(ctx, convID, parsed.ConvType, s.segmentSize, base)
+	if err != nil {
+		return 0, err
+	}
+	segment = &seqSegment{end: end}
+	segment.last.Store(start)
+	s.segments.Store(convID, segment)
+	return start, nil
 }
 
-// seqBase 计算 seq 计数器的校正值。conv_meta 由 deliver 消费者维护，可能比 MySQL 更新。
+// seqBase 为申请号段读取旧数据的下限，兼容旧链路已投递但未落库的 seq。
 func (s *MsgService) seqBase(ctx context.Context, convID string) (int64, error) {
 	base, err := s.store.GetMaxSeq(ctx, convID)
 	if err != nil {
@@ -437,32 +477,43 @@ func (s *MsgService) seqBase(ctx context.Context, convID string) (int64, error) 
 	return base, nil
 }
 
-// deliveredSeq 返回会话的已投递水位：max(MySQL 已落库 seq, deliver 消费者维护的 conv_meta.seq)。
-// 由于同一会话的 seq 分配与 Kafka 写入在会话锁内串行，水位以下的 seq 要么已被消费者处理，要么是空洞。
-func (s *MsgService) deliveredSeq(ctx context.Context, convID string) (int64, error) {
-	return s.seqBase(ctx, convID)
-}
-
-// CurrentSeq 返回会话当前已分配的最大 seq（包含已分配但还在写 Kafka 的）。
-// 用于确定可见下界（清空记录、入群），保证此刻之前分配的消息都不可见。
+// CurrentSeq 读取实际分配或落库的位置，不等待持有会话锁的发送流程。
 func (s *MsgService) CurrentSeq(ctx context.Context, convID string) (int64, error) {
-	if seq, ok, err := s.cache.CurrentSeq(ctx, convID); err == nil && ok {
-		return seq, nil
+	current, err := s.store.GetMaxSeq(ctx, convID)
+	if err != nil {
+		return 0, err
 	}
-	return s.seqBase(ctx, convID)
+	if value, ok := s.segments.Load(convID); ok {
+		current = max(current, value.(*seqSegment).last.Load())
+	}
+	return current, nil
+}
+
+// WithCurrentSeq 将读取实际位置与边界操作一起串行化（清空/入群期间不发送新消息）。
+func (s *MsgService) WithCurrentSeq(ctx context.Context, convID string, apply func(int64) error) error {
+	unlock, err := s.locks.lock(ctx, convID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	current, err := s.CurrentSeq(ctx, convID)
+	if err != nil {
+		return err
+	}
+	return apply(current)
 }
 
 // ──────────────────────────────────────────────────────
-// 投递（由 deliver 消费者调用）
+// 投递（由 msg-persist 在落库后调用）
 // ──────────────────────────────────────────────────────
 
-// DeliverMessage 更新热缓存并推送给在线成员（不含发送者，发送者已通过 serverAck 得知结果）。
+// DeliverMessage 更新会话缓存并推送给在线成员（不含发送者，发送者已通过 serverAck 得知结果）。
 // 缓存写失败只记日志：读路径会回源 MySQL；只有解析成员失败才返回错误让消费者重试。
 func (s *MsgService) DeliverMessage(ctx context.Context, msg *model.Message) error {
 	if err := s.cache.CacheMessage(ctx, msg); err != nil {
 		s.logger.Warn("写入消息缓存失败", zap.String("convID", msg.ConvID), zap.Int64("seq", msg.Seq), zap.Error(err))
 	}
-	if msg.MsgType == model.MsgTypeRevoked {
+	if msg.ConvType != model.ConvTypeGroup && msg.MsgType == model.MsgTypeRevoked {
 		var notice model.RevokeNotice
 		if err := json.Unmarshal([]byte(msg.Content), &notice); err == nil && notice.TargetSeq > 0 {
 			if err := s.cache.MarkCachedRevoked(ctx, msg.ConvID, notice.TargetSeq); err != nil {
@@ -511,8 +562,7 @@ func (s *MsgService) recipients(ctx context.Context, msg *model.Message) ([]int6
 // 会话同步与拉取
 // ──────────────────────────────────────────────────────
 
-// ListConversations 返回用户的会话视图列表，按置顶、最后消息时间倒序。
-// maxSeq 取 MySQL conversations 与 Redis conv_meta 中较大者：后者由 deliver 消费者维护，通常更新。
+// ListConversations 使用已落库的会话位置和摘要，按置顶、最后消息时间倒序。
 func (s *MsgService) ListConversations(ctx context.Context, userID int64) ([]model.ConvView, error) {
 	ucs, err := s.store.ListUserConversations(ctx, userID)
 	if err != nil {
@@ -547,11 +597,9 @@ func (s *MsgService) ListConversations(ctx context.Context, userID int64) ([]mod
 			Pinned:       uc.Pinned,
 			Muted:        uc.Muted,
 		}
-		if m, ok := metas[uc.ConvID]; ok && m.Seq >= view.MaxSeq && m.LastMsg != nil {
-			view.MaxSeq = m.Seq
+		// 仅用与已落库最后一条消息一致的缓存补充 LastMsg。
+		if m, ok := metas[uc.ConvID]; ok && m.Seq == c.MaxSeq && m.LastMsg != nil && m.LastMsg.MsgID == c.LastMsgID {
 			view.LastMsg = m.LastMsg
-			view.LastMsgBrief = model.MsgBrief(m.LastMsg.MsgType, m.LastMsg.Content)
-			view.LastMsgTime = m.LastMsg.Timestamp
 		}
 		// 删除会话后没有新消息：不展示
 		if uc.Hidden && view.MaxSeq < uc.MinSeq {
@@ -566,13 +614,13 @@ func (s *MsgService) ListConversations(ctx context.Context, userID int64) ([]mod
 		if floor := uc.MinSeq - 1; floor > view.ReadSeq {
 			view.ReadSeq = floor
 		}
-		if view.Unread = view.MaxSeq - view.ReadSeq; view.Unread < 0 {
-			view.Unread = 0
-		}
 		views = append(views, view)
 	}
 
-	s.correctUnread(ctx, userID, views)
+	if err := s.fillUnread(ctx, userID, views); err != nil {
+		s.logger.Error("统计未读消息失败", zap.Error(err))
+		return nil, errMsgInternal
+	}
 	s.fillTargets(ctx, userID, views)
 
 	sort.SliceStable(views, func(i, j int) bool {
@@ -584,31 +632,25 @@ func (s *MsgService) ListConversations(ctx context.Context, userID int64) ([]mod
 	return views, nil
 }
 
-// correctUnread 从 maxSeq-readSeq 中扣除不应计入未读的消息：撤回通知、已撤回的消息、自己发的消息。
-// 只按 MySQL 计算，尚未落库的最新几条（通常是毫秒级窗口）不参与校正；空洞仍会被计入（发送失败才会产生，极少）。
-// 查询失败时保留未校正的值。
-func (s *MsgService) correctUnread(ctx context.Context, userID int64, views []model.ConvView) {
+// fillUnread 统计已落库的有效消息数。空洞和未使用号段不计数，不按 seq 差值降级。
+func (s *MsgService) fillUnread(ctx context.Context, userID int64, views []model.ConvView) error {
 	ranges := make([]repository.SeqRange, 0, len(views))
 	for _, v := range views {
-		if v.Unread > 0 && v.Unread <= unreadExactLimit {
+		if v.MaxSeq > v.ReadSeq {
 			ranges = append(ranges, repository.SeqRange{ConvID: v.ConvID, From: v.ReadSeq + 1, To: v.MaxSeq})
 		}
 	}
 	if len(ranges) == 0 {
-		return
+		return nil
 	}
-	skip, err := s.store.CountNonUnread(ctx, userID, ranges)
+	counts, err := s.store.CountUnread(ctx, userID, ranges)
 	if err != nil {
-		s.logger.Warn("校正未读数失败", zap.Error(err))
-		return
+		return err
 	}
 	for i := range views {
-		if n := skip[views[i].ConvID]; n > 0 {
-			if views[i].Unread -= n; views[i].Unread < 0 {
-				views[i].Unread = 0
-			}
-		}
+		views[i].Unread = counts[views[i].ConvID]
 	}
+	return nil
 }
 
 // fillTargets 批量填充会话对象（私聊对方 / 群）的名称与头像；查询失败时只缺展示字段，不影响同步。
@@ -667,9 +709,8 @@ func (s *MsgService) requireMember(ctx context.Context, userID int64, convID str
 }
 
 // PullMessages 返回 [fromSeq, toSeq] 内对该用户可见的消息。
-// toSeq<=0 表示拉到最新。上界总是截到已投递水位：已分配但还在写 Kafka 的 seq 不能被当作空洞跳过。
-// 区间超过 100 条时截断并置 hasMore，客户端从 toSeq+1 继续。
-// 优先读 Redis 热窗口，窗口不完整时回源 MySQL 并与缓存合并（缓存里可能有尚未落库的最新消息）。
+// toSeq<=0 表示拉到最新。上界与消息都取自 MySQL，避免跨过仍在处理的消息。
+// 区间超过 100 个 seq 时截断并置 hasMore，客户端从 toSeq+1 继续。
 func (s *MsgService) PullMessages(ctx context.Context, userID int64, convID string, fromSeq, toSeq int64) (*model.PullMsgsResp, error) {
 	uc, err := s.requireMember(ctx, userID, convID)
 	if err != nil {
@@ -681,7 +722,7 @@ func (s *MsgService) PullMessages(ctx context.Context, userID int64, convID stri
 	if fromSeq < 1 {
 		fromSeq = 1
 	}
-	watermark, err := s.deliveredSeq(ctx, convID)
+	watermark, err := s.store.GetMaxSeq(ctx, convID)
 	if err != nil {
 		s.logger.Error("读取会话水位失败", zap.Error(err))
 		return nil, errMsgInternal
@@ -699,40 +740,13 @@ func (s *MsgService) PullMessages(ctx context.Context, userID int64, convID stri
 		resp.HasMore = true
 	}
 
-	msgs, err := s.loadRange(ctx, convID, fromSeq, toSeq)
+	msgs, err := s.store.GetMessagesBySeqRange(ctx, convID, fromSeq, toSeq, pullMaxBatch)
 	if err != nil {
 		s.logger.Error("拉取消息失败", zap.String("convID", convID), zap.Error(err))
 		return nil, errMsgInternal
 	}
 	resp.Msgs = s.filterDeleted(ctx, userID, convID, msgs, fromSeq, toSeq)
 	return resp, nil
-}
-
-// loadRange 读取 [fromSeq, toSeq] 内的全部消息（不做用户级过滤），按 seq 升序。
-func (s *MsgService) loadRange(ctx context.Context, convID string, fromSeq, toSeq int64) ([]model.Message, error) {
-	cached, cacheErr := s.cache.GetCachedRange(ctx, convID, fromSeq, toSeq)
-	if cacheErr == nil && int64(len(cached)) == toSeq-fromSeq+1 {
-		return cached, nil
-	}
-	stored, err := s.store.GetMessagesBySeqRange(ctx, convID, fromSeq, toSeq, pullMaxBatch)
-	if err != nil {
-		return nil, err
-	}
-	bySeq := make(map[int64]model.Message, len(stored)+len(cached))
-	for _, m := range stored {
-		bySeq[m.Seq] = m
-	}
-	for _, m := range cached {
-		if _, ok := bySeq[m.Seq]; !ok {
-			bySeq[m.Seq] = m
-		}
-	}
-	out := make([]model.Message, 0, len(bySeq))
-	for _, m := range bySeq {
-		out = append(out, m)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	return out, nil
 }
 
 // filterDeleted 去掉用户删除过的消息。查询失败时不过滤，保证可用性。
@@ -758,37 +772,99 @@ func (s *MsgService) filterDeleted(ctx context.Context, userID int64, convID str
 }
 
 // GetHistory 返回 seq < beforeSeq 的历史消息（按 seq 升序），用于聊天窗口上滑加载。
-// beforeSeq<=0 表示从最新开始。历史分页只读 MySQL；尚未落库的最新消息由 pullMsgs 覆盖。
+// beforeSeq<=0 表示从最新开始。历史和增量补拉均以已落库消息为准。
 func (s *MsgService) GetHistory(ctx context.Context, userID int64, convID string, beforeSeq int64, limit int) ([]model.Message, bool, error) {
-	uc, err := s.requireMember(ctx, userID, convID)
+	conv, err := model.ParseConvID(convID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, errMsgInvalid
 	}
-	limit = clampLimit(limit, historyMaxLimit)
-	if beforeSeq <= 0 {
-		beforeSeq = math.MaxInt64
-	}
-	msgs, err := s.store.GetMessagesBefore(ctx, convID, beforeSeq, uc.MinSeq, limit)
+	state, err := s.store.GetHistoryState(ctx, userID, convID, conv.ConvType)
 	if err != nil {
-		s.logger.Error("查询历史消息失败", zap.Error(err))
+		s.logger.Error("查询历史消息权限和版本失败", zap.Error(err))
 		return nil, false, errMsgInternal
 	}
-	hasMore := len(msgs) == limit
+	if state == nil {
+		return nil, false, errConvNotFound
+	}
+	limit = clampLimit(limit, historyMaxLimit)
+	firstPage := beforeSeq <= 0
+	if firstPage {
+		beforeSeq = math.MaxInt64
+	}
+	var msgs []model.Message
+	var hit bool
+	if conv.ConvType == model.ConvTypeGroup {
+		msgs, hit = s.groupHistoryPage(ctx, userID, convID, *state, beforeSeq, limit+1, firstPage)
+	}
+	if !hit {
+		msgs, err = s.store.GetMessagesBefore(ctx, userID, convID, beforeSeq, state.MinSeq, limit+1)
+		if err != nil {
+			s.logger.Error("查询历史消息失败", zap.Error(err))
+			return nil, false, errMsgInternal
+		}
+	}
+	hasMore := len(msgs) > limit
+	if hasMore {
+		msgs = msgs[:limit]
+	}
 	// 倒序查出，翻转为升序
 	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
 		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
-	if len(msgs) > 0 {
-		msgs = s.filterDeleted(ctx, userID, convID, msgs, msgs[0].Seq, msgs[len(msgs)-1].Seq)
-	}
 	return msgs, hasMore, nil
+}
+
+func (s *MsgService) groupHistoryPage(ctx context.Context, userID int64, convID string, state repository.HistoryState, beforeSeq int64, limit int, firstPage bool) ([]model.Message, bool) {
+	window, err := s.cache.GetGroupHistory(ctx, convID, state.Version)
+	if err != nil {
+		return nil, false
+	}
+	if len(window) == 0 && firstPage {
+		window, err = s.store.GetGroupHistoryWindow(ctx, convID, state.Version, groupHistoryWindowSize)
+		if err != nil || len(window) == 0 {
+			return nil, false
+		}
+		if err := s.cache.SetGroupHistory(ctx, convID, state.Version, window); err != nil {
+			s.logger.Debug("回填群历史缓存失败", zap.Error(err))
+		}
+	}
+	if len(window) == 0 {
+		return nil, false
+	}
+	oldest := window[len(window)-1].Seq
+	complete := len(window) < groupHistoryWindowSize || oldest <= state.MinSeq
+	start := sort.Search(len(window), func(i int) bool { return window[i].Seq < beforeSeq })
+	end := sort.Search(len(window), func(i int) bool { return window[i].Seq < state.MinSeq })
+	if !complete && end-start < limit {
+		return nil, false
+	}
+	if start >= end {
+		return []model.Message{}, true
+	}
+	candidates := window[start:end]
+	deleted, err := s.store.GetUserDeletedSeqs(ctx, userID, convID, candidates[len(candidates)-1].Seq, candidates[0].Seq)
+	if err != nil {
+		return nil, false
+	}
+	page := make([]model.Message, 0, min(limit, len(candidates)))
+	for _, msg := range candidates {
+		if _, hidden := deleted[msg.Seq]; hidden {
+			continue
+		}
+		page = append(page, msg)
+		if len(page) == limit {
+			break
+		}
+	}
+	// 没有足够的可见消息判断 hasMore，且窗口可能还有更早记录时，整页回源。
+	return page, complete || len(page) == limit
 }
 
 // ──────────────────────────────────────────────────────
 // 已读、撤回、删除、清空、搜索
 // ──────────────────────────────────────────────────────
 
-// MarkRead 把已读位置推进到 seq；seq 超过当前最大值时截断，避免未读数被算成负数。
+// MarkRead 把已读位置推进到 seq；截到实际位置，禁止客户端将未使用号段提前标为已读。
 func (s *MsgService) MarkRead(ctx context.Context, userID int64, convID string, seq int64) error {
 	if seq <= 0 {
 		return errMsgInvalid
@@ -796,10 +872,12 @@ func (s *MsgService) MarkRead(ctx context.Context, userID int64, convID string, 
 	if _, err := s.requireMember(ctx, userID, convID); err != nil {
 		return err
 	}
-	if cur, ok, err := s.cache.CurrentSeq(ctx, convID); err == nil && ok && seq > cur {
-		seq = cur
+	current, err := s.CurrentSeq(ctx, convID)
+	if err != nil {
+		s.logger.Error("读取会话实际位置失败", zap.Error(err))
+		return errMsgInternal
 	}
-	if err := s.store.UpdateReadSeq(ctx, userID, convID, seq); err != nil {
+	if err := s.store.UpdateReadSeq(ctx, userID, convID, min(seq, current)); err != nil {
 		s.logger.Error("更新已读位置失败", zap.Error(err))
 		return errMsgInternal
 	}
@@ -823,7 +901,7 @@ func revokeClientMsgID(convID string, seq int64) string {
 
 // RevokeMessage 撤回自己 2 分钟内发送的消息。
 // 校验通过后发送一条 msgType=6 的撤回通知，占用新的 seq：
-// persist 消费者在同一事务里把原消息置为已撤回，deliver 消费者更新缓存并推送给其它成员。
+// 消费者在事务中把原消息置为已撤回，提交后更新缓存并推送给其它成员。
 // 撤回通知和原消息在同一 Kafka 分区内，处理顺序一定在原消息之后。
 func (s *MsgService) RevokeMessage(ctx context.Context, userID int64, convID string, seq int64) (*model.ServerAck, error) {
 	if seq <= 0 {
@@ -833,12 +911,10 @@ func (s *MsgService) RevokeMessage(ctx context.Context, userID int64, convID str
 		return nil, err
 	}
 
-	target, err := s.cache.GetCachedMessage(ctx, convID, seq)
-	if err != nil || target == nil {
-		if target, err = s.store.GetMessage(ctx, convID, seq); err != nil {
-			s.logger.Error("查询待撤回消息失败", zap.Error(err))
-			return nil, errMsgInternal
-		}
+	target, err := s.store.GetMessage(ctx, convID, seq)
+	if err != nil {
+		s.logger.Error("查询待撤回消息失败", zap.Error(err))
+		return nil, errMsgInternal
 	}
 	if target == nil || target.Status == model.MsgStatusRevoked ||
 		target.MsgType == model.MsgTypeRevoked || target.MsgType == model.MsgTypeSystem {
@@ -891,12 +967,10 @@ func (s *MsgService) advanceMinSeq(ctx context.Context, userID int64, convID str
 	if _, err := s.requireMember(ctx, userID, convID); err != nil {
 		return err
 	}
-	cur, err := s.CurrentSeq(ctx, convID)
+	err := s.WithCurrentSeq(ctx, convID, func(current int64) error {
+		return s.store.UpdateMinSeq(ctx, userID, convID, current+1, hide)
+	})
 	if err != nil {
-		s.logger.Error("读取会话 seq 失败", zap.Error(err))
-		return errMsgInternal
-	}
-	if err := s.store.UpdateMinSeq(ctx, userID, convID, cur+1, hide); err != nil {
 		s.logger.Error("更新可见下界失败", zap.Error(err))
 		return errMsgInternal
 	}

@@ -113,7 +113,7 @@ type PullMsgsReq struct {
 }
 
 // PullMsgsResp — pullMsgs 的响应；HasMore 表示区间被截断，客户端应从 ToSeq+1 继续拉。
-// Watermark 是会话的已投递水位：seq <= Watermark 的消息都已被消费者处理，区间内缺失的 seq 是空洞，不会再出现。
+// Watermark 是会话在 MySQL 中已落库的最大 seq，用于限制本次补拉区间。
 // ToSeq 不会超过 Watermark，客户端可以安全地把本地同步位置推进到 ToSeq。
 type PullMsgsResp struct {
 	ConvID    string    `json:"convId"`
